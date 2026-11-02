@@ -99,13 +99,8 @@ end
 
 @testset "type-descriptor errors" begin
     ctx = SerdeContext((M,))
-    # Partially-applied UnionAll is unsupported.
-    @test_throws ErrorException TypeAgnosticSerialisation._type_desc(Array{Float64}, ctx)
-    # A Union used as a type parameter is a non-concrete parameter.
-    @test_throws ErrorException TypeAgnosticSerialisation._type_desc(
-        Union{Int,Float64},
-        ctx,
-    )
+    # A value that is not a type, a TypeVar or a Vararg has no type descriptor.
+    @test_throws ErrorException TypeAgnosticSerialisation._type_desc(1, ctx)
 end
 
 @testset "module allowlist" begin

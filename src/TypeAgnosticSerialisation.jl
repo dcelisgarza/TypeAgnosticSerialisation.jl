@@ -46,7 +46,8 @@
 # is a package extension in `ext/` that loads with its backend package; see formats.jl.
 #
 # Reserved tree keys: "__type__", "__value__" (tagged envelope); "type"/"value"
-# (type-parameter wrappers); "size"/"data" (arrays); "pairs" (dicts);
+# (type-parameter wrappers); "union", "where"/"body", "typevar", "vararg"/"count"
+# (non-DataType type descriptors); "size"/"data" (arrays); "pairs" (dicts);
 # "names"/"values" (named tuples). A struct field literally named "__type__" would
 # collide — documented limitation.
 
@@ -127,49 +128,101 @@ function _construct_opaque(@nospecialize(T))
 end
 
 # ---------------------------------------------------------------------------
-# Type descriptors: serialise a concrete type (with parameters) to a plain tree,
-# and resolve one back — through the allowlist only.
+# Type descriptors: serialise a type (with parameters) to a plain tree, and resolve one
+# back — through the allowlist only.
+#
+# A descriptor is one of these dicts:
+#
+#   {"name", "module", "params"}          a DataType, or a bare UnionAll wrapper (`Vector`)
+#   {"union": [desc, …]}                  a Union (`Union{Missing,Float64}`)
+#   {"where": {var,lb,ub}, "body": desc}  a general UnionAll (`Vector{<:Real}`)
+#   {"typevar": name}                     a variable bound by an enclosing "where"
+#   {"vararg": desc, "count": param}      a `Vararg{T,N}` (no "count" for `Vararg{T}`)
+#
+# The non-DataType forms let an array (or a dict, or any type parameter) carry an
+# abstract element type that is not a plain abstract DataType: `Vector{Vector}`,
+# `Vector{Union{Nothing,Int}}`, `Vector{Vector{<:Real}}`, `Vector{Tuple}`, ….
+#
+# `env` is the stack of TypeVars bound by the enclosing "where" descriptors, innermost
+# last. A "typevar" reference resolves to the innermost binding with that name.
 # ---------------------------------------------------------------------------
 
-# A type parameter is either a Type or a bits value (Int, Symbol, Bool, ...).
-function _param_desc(@nospecialize(p), ctx::SerdeContext)
-    if p isa Type
-        return Dict{String,Any}("type" => _type_desc(p, ctx))
+# Anything `_type_desc` can describe, i.e. what can sit in a parameter list as a type.
+_is_typeish(@nospecialize(p)) = p isa Type || p isa TypeVar || p isa Core.TypeofVararg
+
+# A type parameter is either type-like (Type, TypeVar, Vararg) or a bits value
+# (Int, Symbol, Bool, ...).
+function _param_desc(@nospecialize(p), ctx::SerdeContext, env::Vector{TypeVar} = TypeVar[])
+    if _is_typeish(p)
+        return Dict{String,Any}("type" => _type_desc(p, ctx, env))
     else
         # A value used as a type parameter; self-describe it fully.
         return Dict{String,Any}("value" => encode(p, Any, ctx))
     end
 end
 
-function _type_desc(@nospecialize(T), ctx::SerdeContext)
+# A bare UnionAll wrapper (`Vector`, `Circle`) is the binding of its own name in its module.
+function _is_bare_wrapper(@nospecialize(T::UnionAll))
+    m, n = parentmodule(T), nameof(T)
+    return isdefined(m, n) && getfield(m, n) === T
+end
+
+function _type_desc(@nospecialize(T), ctx::SerdeContext, env::Vector{TypeVar} = TypeVar[])
     if T === Union{}
         return Dict{String,Any}("name" => "Bottom", "module" => "Core", "params" => Any[])
-    elseif T isa UnionAll
-        # Only the bare wrapper form (e.g. `Newton`, `Vector`) is supported; that
-        # resolves back through the allowlist by name with no parameters.
-        if !(T === getfield(parentmodule(T), nameof(T)))
+    elseif T isa TypeVar
+        # The innermost binding with this name must be this very TypeVar; otherwise the
+        # variable is free, or an outer one shadowed by a namesake, and a name alone
+        # cannot say which binding it refers to.
+        idx = findlast(tv -> tv.name === T.name, env)
+        if idx === nothing || env[idx] !== T
             error(
-                "TypeAgnosticSerialisation: partially-applied UnionAll $(T) is unsupported. " *
-                "If it lives inside a live / non-data object (e.g. a solver model), " *
-                "mark that object's type opaque, e.g. opaque = (JuMP.Model,).",
+                "TypeAgnosticSerialisation: type variable $(T) is free or shadowed by an " *
+                "inner variable of the same name; it cannot be serialised by name.",
             )
         end
+        return Dict{String,Any}("typevar" => String(T.name))
+    elseif T isa Core.TypeofVararg
+        d = Dict{String,Any}("vararg" => _type_desc(isdefined(T, :T) ? T.T : Any, ctx, env))
+        if isdefined(T, :N)
+            d["count"] = _param_desc(T.N, ctx, env)
+        end
+        return d
+    elseif T isa Union
         return Dict{String,Any}(
-            "name" => string(nameof(T)),
-            "module" => string(parentmodule(T)),
-            "params" => Any[],
+            "union" => Any[_type_desc(U, ctx, env) for U in Base.uniontypes(T)],
         )
+    elseif T isa UnionAll
+        if _is_bare_wrapper(T)
+            # Compact, readable form; resolves back through the allowlist by name.
+            return Dict{String,Any}(
+                "name" => string(nameof(T)),
+                "module" => string(parentmodule(T)),
+                "params" => Any[],
+            )
+        end
+        tv = T.var
+        # The bounds are in the scope of the enclosing variables only, not of `tv`.
+        var = Dict{String,Any}(
+            "var" => String(tv.name),
+            "lb" => _type_desc(tv.lb, ctx, env),
+            "ub" => _type_desc(tv.ub, ctx, env),
+        )
+        push!(env, tv)
+        try
+            return Dict{String,Any}("where" => var, "body" => _type_desc(T.body, ctx, env))
+        finally
+            pop!(env)
+        end
     elseif T isa DataType
         return Dict{String,Any}(
             "name" => string(nameof(T)),
             "module" => string(parentmodule(T)),
-            "params" => Any[_param_desc(p, ctx) for p in T.parameters],
+            "params" => Any[_param_desc(p, ctx, env) for p in T.parameters],
         )
     else
-        # UnionAll / Union type parameters (e.g. Vector{Vector}) are an extension
-        # point — the estimator use case has fully concrete parameters.
         error(
-            "TypeAgnosticSerialisation: unsupported non-concrete type parameter $(T)::$(typeof(T)). " *
+            "TypeAgnosticSerialisation: unsupported type parameter $(T)::$(typeof(T)). " *
             "Add a rule in _type_desc/_resolve_type if you need it.",
         )
     end
@@ -201,15 +254,44 @@ function _lookup_module(modname::AbstractString, ctx::SerdeContext)
     )
 end
 
-function _resolve_param(p, ctx::SerdeContext)
+function _resolve_param(p, ctx::SerdeContext, env::Vector{TypeVar} = TypeVar[])
     if haskey(p, "type")
-        return _resolve_type(p["type"], ctx)
+        return _resolve_type(p["type"], ctx, env)
     else
         return decode(p["value"], Any, ctx)
     end
 end
 
-function _resolve_type(desc, ctx::SerdeContext)
+function _resolve_type(desc, ctx::SerdeContext, env::Vector{TypeVar} = TypeVar[])
+    if haskey(desc, "typevar")
+        name = Symbol(desc["typevar"])
+        idx = findlast(tv -> tv.name === name, env)
+        if idx === nothing
+            error("TypeAgnosticSerialisation: type variable $(name) is not bound.")
+        end
+        return env[idx]
+    elseif haskey(desc, "vararg")
+        T = _resolve_type(desc["vararg"], ctx, env)
+        if haskey(desc, "count")
+            return Vararg{T,_resolve_param(desc["count"], ctx, env)}
+        else
+            return Vararg{T}
+        end
+    elseif haskey(desc, "union")
+        return Union{Any[_resolve_type(d, ctx, env) for d in desc["union"]]...}
+    elseif haskey(desc, "where")
+        var = desc["where"]
+        lb = _resolve_type(var["lb"], ctx, env)
+        ub = _resolve_type(var["ub"], ctx, env)
+        tv = TypeVar(Symbol(var["var"]), lb, ub)
+        push!(env, tv)
+        body = try
+            _resolve_type(desc["body"], ctx, env)
+        finally
+            pop!(env)
+        end
+        return UnionAll(tv, body)
+    end
     if desc["name"] == "Bottom"
         return Union{}
     end
@@ -224,14 +306,15 @@ function _resolve_type(desc, ctx::SerdeContext)
     if !(base isa Type)
         error("TypeAgnosticSerialisation: $(desc["module"]).$(desc["name"]) is not a type.")
     end
-    params = Any[_resolve_param(p, ctx) for p in desc["params"]]
+    params = Any[_resolve_param(p, ctx, env) for p in desc["params"]]
     if !isempty(params)
         return Core.apply_type(base, params...)
     else
         # Zero params: a leaf DataType (Symbol, Int64, Nothing) or a bare UnionAll
         # (Newton, Vector) resolves to `base` as-is — `apply_type` would error on
         # leaves. The one exception is the empty tuple type, whose `getfield` result
-        # is the *abstract* `Tuple`, not the concrete `Tuple{}`.
+        # is the *abstract* `Tuple`, not the concrete `Tuple{}`. (The abstract `Tuple`
+        # is `Tuple{Vararg{Any}}`, so it always carries its Vararg parameter.)
         return base === Tuple ? Tuple{} : base
     end
 end

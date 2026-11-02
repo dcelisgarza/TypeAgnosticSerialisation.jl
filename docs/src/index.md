@@ -286,12 +286,23 @@ julia> (rt.w, rt.h)
 (3, 4)
 ```
 
+## Abstract element types
+
+Containers with an abstract element type round-trip, and every element carries its own
+concrete type tag. This covers plain abstract types (`Vector{Real}`, `Vector{AbstractShape}`),
+unions (`Vector{Union{Missing,Float64}}`), partially-applied `UnionAll`s (`Vector{Vector}`,
+`Vector{Vector{<:Real}}`, `Dict{String,Vector}`) and `Vararg` tuples (`Vector{Tuple}`,
+`Vector{NTuple{N,Int} where N}`). The same type descriptors let a value that *is* such a
+type (e.g. a field holding `Vector{<:Real}`) round-trip. Every type named inside a union or a
+`where` body is resolved through the module allowlist like any other.
+
 ## Reserved keys and limitations
 
 The envelope reserves a handful of tree keys: `"__type__"`, `"__value__"` (the tagged
-envelope); `"type"`/`"value"` (type-parameter wrappers); `"size"`/`"data"` (arrays);
-`"pairs"` (dicts); `"names"`/`"values"` (named tuples); and `"__opaque__"` (opaque
-placeholders). A struct field literally named `__type__` would collide — a documented
+envelope); `"type"`/`"value"` (type-parameter wrappers); `"union"`, `"where"`/`"body"`,
+`"typevar"` and `"vararg"`/`"count"` (non-`DataType` type descriptors); `"size"`/`"data"`
+(arrays); `"pairs"` (dicts); `"names"`/`"values"` (named tuples); and `"__opaque__"`
+(opaque placeholders). A struct field literally named `__type__` would collide — a documented
 limitation. `#undef` fields are unsupported and are reported rather than silently dropped.
 
 ## Reference

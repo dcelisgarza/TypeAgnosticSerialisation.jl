@@ -44,6 +44,11 @@ const FORMAT_VALUES = Any[
     Complex(1.0, 2.0),
     3//4,
     Any[nothing, missing, 1, "s"],
+    # Abstract element types: a Union, a partially-applied UnionAll and a Vararg each
+    # need their own type descriptor.
+    Union{Missing,Float64}[1.0, missing],
+    Vector{Vector{<:Real}}([[1], [2.0]]),
+    Tuple[(1,), (1, "a")],
 ]
 
 @testset "$name" for (name, (to, from, from_direct)) in FORMATS
