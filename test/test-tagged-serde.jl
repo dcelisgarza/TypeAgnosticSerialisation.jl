@@ -1,143 +1,4 @@
-using TypeAgnosticSerialisation
-using TypeAgnosticSerialisation:
-    SerdeContext, encode, decode, to_json, from_json, from_json_direct
-using Test
-import TOML
-
-# ---------------------------------------------------------------------------
-# A self-contained domain to exercise the whole library. Nothing here depends on
-# anything outside Base/Core, so the suite is hermetic.
-# ---------------------------------------------------------------------------
-module TestSerdeModule
-
-export AbstractShape, Circle, Rect, Square, Color, red, green, blue
-export Scene, Doc, KwOnly, Handle, NoDefault
-
-abstract type AbstractShape end
-
-# Parametric struct with a validating inner constructor: `from_json` must enforce the
-# `r > 0` invariant, `from_json_direct` must be able to bypass it.
-struct Circle{T} <: AbstractShape
-    r::T
-    function Circle{T}(r::T) where {T}
-        r > 0 || error("Circle: radius must be positive (got $r)")
-        return new{T}(r)
-    end
-end
-Circle(r::T) where {T} = Circle{T}(r)
-
-struct Rect{T} <: AbstractShape
-    w::T
-    h::T
-end
-
-struct Square <: AbstractShape end   # singleton, zero fields
-
-@enum Color red green blue
-
-# The payoff type: a heterogeneous `Vector{AbstractShape}`, an enum, and an `Any`-valued
-# dict — none of the element types are known statically, so each carries its own tag.
-struct Scene
-    shapes::Vector{AbstractShape}
-    bg::Color
-    meta::Dict{String,Any}
-end
-
-# A "live" non-data handle: a raw pointer that cannot be serialised structurally. Used to
-# show `opaque` skipping and the "fail loudly" path.
-struct Handle
-    ptr::Ptr{Cvoid}
-    Handle() = new(C_NULL)
-end
-
-# Data wrapping a live handle, to show surrounding data survives when the handle is opaque.
-struct Doc
-    title::String
-    handle::Handle
-end
-
-# Only a keyword constructor -> exercises `_construct_safe`'s keyword-by-field-name fallback.
-struct KwOnly
-    a::Int
-    b::Int
-    KwOnly(; a, b) = new(a, b)
-end
-
-# Opaque type with no zero-argument constructor -> `_construct_opaque` must fail loudly.
-struct NoDefault
-    x::Int
-end
-
-end # module TestSerdeModule
-
-using .TestSerdeModule
-const M = TestSerdeModule
-
-# ---------------------------------------------------------------------------
-# Test helpers (kept out of the package — they are not public API).
-# ---------------------------------------------------------------------------
-
-# Structural equality: user structs rarely define `==`, and `NaN != NaN`, so compare
-# field-by-field with `isequal` at the leaves.
-function structeq(a, b)
-    typeof(a) === typeof(b) || return false
-    T = typeof(a)
-    if a isa AbstractFloat
-        return isequal(a, b)                       # handles NaN / signed zero
-    elseif a isa Number ||
-           a isa AbstractString ||
-           a isa Symbol ||
-           a isa AbstractChar ||
-           a isa Base.Enum
-        return a == b
-    elseif a isa AbstractArray
-        size(a) == size(b) || return false
-        return all(structeq(x, y) for (x, y) in zip(a, b))
-    elseif a isa AbstractDict
-        length(a) == length(b) || return false
-        for (k, v) in a
-            haskey(b, k) || return false
-            structeq(v, b[k]) || return false
-        end
-        return true
-    elseif a isa Tuple || a isa NamedTuple
-        return all(structeq(getfield(a, i), getfield(b, i)) for i = 1:nfields(a))
-    elseif isstructtype(T)
-        for i = 1:fieldcount(T)
-            (isdefined(a, i) == isdefined(b, i)) || return false
-            isdefined(a, i) || continue
-            structeq(getfield(a, i), getfield(b, i)) || return false
-        end
-        return true
-    else
-        return isequal(a, b)
-    end
-end
-
-# Round-trip `x` through BOTH the tree layer (encode/decode) and the text layer
-# (to_json/from_json*), returning the reconstructed values and whether they match.
-function roundtrip(x; modules = (), opaque = (), validate = false)
-    ctx = SerdeContext(modules; opaque = opaque, validate = validate)
-    x_tree = decode(encode(x, ctx), ctx)
-    js = to_json(x; modules = modules, opaque = opaque)
-    x_text =
-        validate ? from_json(js; modules = modules, opaque = opaque) :
-        from_json_direct(js; modules = modules, opaque = opaque)
-    return (;
-        tree = x_tree,
-        text = x_text,
-        ok_tree = structeq(x, x_tree),
-        ok_text = structeq(x, x_text),
-    )
-end
-
-# A representative Scene: three shapes of three different concrete types under one abstract
-# element type, plus a heterogeneous metadata dict.
-sample_scene() = Scene(
-    AbstractShape[Circle(1.5), Rect(3, 4), Square()],
-    green,
-    Dict{String,Any}("author" => "ada", "count" => 3, "ratio" => 2.5),
-)
+isdefined(@__MODULE__, :TestSerdeModule) || include("setup.jl")
 
 # ===========================================================================
 
@@ -238,13 +99,8 @@ end
 
 @testset "type-descriptor errors" begin
     ctx = SerdeContext((M,))
-    # Partially-applied UnionAll is unsupported.
-    @test_throws ErrorException TypeAgnosticSerialisation._type_desc(Array{Float64}, ctx)
-    # A Union used as a type parameter is a non-concrete parameter.
-    @test_throws ErrorException TypeAgnosticSerialisation._type_desc(
-        Union{Int,Float64},
-        ctx,
-    )
+    # A value that is not a type, a TypeVar or a Vararg has no type descriptor.
+    @test_throws ErrorException TypeAgnosticSerialisation._type_desc(1, ctx)
 end
 
 @testset "module allowlist" begin
@@ -290,6 +146,30 @@ end
     broken = from_json_direct(bad; modules = (M,))
     @test broken isa Circle{Float64}
     @test broken.r == -7.0
+end
+
+@testset "validated rebuild at the exact type parameters" begin
+    # The unparameterised constructor re-derives narrower parameters from the field values
+    # (`Pair(1, "a")` is a `Pair{Int,String}`); the value must come back at the encoded type.
+    for x in Any[
+        Pair{Int,Any}(1, "a"),
+        Pair{Real,AbstractString}(1, "x"),
+        Vector{Pair{<:Integer}}([1 => "a", 0x02 => 3]),
+        Circle{Real}(1),
+        Some{Any}(1),
+    ]
+        r = roundtrip(x; modules = (M,), validate = true)
+        @test r.ok_tree
+        @test r.ok_text
+    end
+    # Validation still runs first: a negative radius is refused even at `Circle{Real}`.
+    ctx = SerdeContext((M,))
+    bad = encode(TypeAgnosticSerialisation._newbuild(Circle{Real}, Any[-1]), ctx)
+    @test_throws ErrorException decode(bad, SerdeContext((M,); validate = true))
+    # No parameterised constructor and no `convert` -> fail loudly, not a wrong type.
+    loose = encode(TypeAgnosticSerialisation._newbuild(Loose{Real}, Any[1]), ctx)
+    @test_throws ErrorException decode(loose, SerdeContext((M,); validate = true))
+    @test decode(loose, ctx) isa Loose{Real}   # direct mode builds it with `new`
 end
 
 @testset "keyword-fallback constructor (KwOnly)" begin

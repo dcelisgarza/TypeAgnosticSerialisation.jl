@@ -1,7 +1,8 @@
 # TypeAgnosticSerialisation — type-tagged (de)serialisation of arbitrary Julia values.
 #
-# Goal: serialise a Julia value to JSON and reconstruct it later *without* knowing
-# its type up front. The JSON carries enough type metadata to rebuild the exact
+# Goal: serialise a Julia value to a portable document (JSON, YAML, TOML, MessagePack)
+# and reconstruct it later *without* knowing its type up front. The document carries
+# enough type metadata to rebuild the exact
 # concrete type tree.
 #
 # Design decisions (from the design conversation):
@@ -37,20 +38,26 @@
 # Layering:
 #   encode(x, ctx)              :: value  -> plain tree (Dict/Vector/scalars) [no deps]
 #   decode(tree, ctx)           :: tree   -> value                           [no deps]
-#   to_json(x; modules)         :: value  -> String                          [JSON]
-#   from_json(str; modules)     :: String -> value  (validated, default)     [JSON]
-#   from_json_direct(str; …)    :: String -> value  (direct `new`, no valid.)[JSON]
+#   to_<fmt>(x; modules)        :: value  -> String/bytes                    [extension]
+#   from_<fmt>(data; modules)   :: data   -> value  (validated, default)     [extension]
+#   from_<fmt>_direct(data; …)  :: data   -> value  (direct `new`, no valid.)[extension]
 #
-# Reserved JSON keys: "__type__", "__value__" (tagged envelope); "type"/"value"
-# (type-parameter wrappers); "size"/"data" (arrays); "pairs" (dicts);
+# The package itself carries only the tree. Each format (JSON, YAML, TOML, MessagePack)
+# is a package extension in `ext/` that loads with its backend package; see formats.jl.
+#
+# Reserved tree keys: "__type__", "__value__" (tagged envelope); "type"/"value"
+# (type-parameter wrappers); "union", "where"/"body", "typevar", "vararg"/"count"
+# (non-DataType type descriptors); "size"/"data" (arrays); "pairs" (dicts);
 # "names"/"values" (named tuples). A struct field literally named "__type__" would
 # collide — documented limitation.
 
 module TypeAgnosticSerialisation
 
-using JSON: JSON   # only used by to_json/from_json; core encode/decode need no deps
-
-export SerdeContext, encode, decode, to_json, from_json, from_json_direct
+export SerdeContext, encode, decode
+export to_json, from_json, from_json_direct
+export to_yaml, from_yaml, from_yaml_direct
+export to_toml, from_toml, from_toml_direct
+export to_msgpack, from_msgpack, from_msgpack_direct
 
 # ---------------------------------------------------------------------------
 # Context: the module allowlist for type resolution.
@@ -121,49 +128,101 @@ function _construct_opaque(@nospecialize(T))
 end
 
 # ---------------------------------------------------------------------------
-# Type descriptors: serialise a concrete type (with parameters) to a plain tree,
-# and resolve one back — through the allowlist only.
+# Type descriptors: serialise a type (with parameters) to a plain tree, and resolve one
+# back — through the allowlist only.
+#
+# A descriptor is one of these dicts:
+#
+#   {"name", "module", "params"}          a DataType, or a bare UnionAll wrapper (`Vector`)
+#   {"union": [desc, …]}                  a Union (`Union{Missing,Float64}`)
+#   {"where": {var,lb,ub}, "body": desc}  a general UnionAll (`Vector{<:Real}`)
+#   {"typevar": name}                     a variable bound by an enclosing "where"
+#   {"vararg": desc, "count": param}      a `Vararg{T,N}` (no "count" for `Vararg{T}`)
+#
+# The non-DataType forms let an array (or a dict, or any type parameter) carry an
+# abstract element type that is not a plain abstract DataType: `Vector{Vector}`,
+# `Vector{Union{Nothing,Int}}`, `Vector{Vector{<:Real}}`, `Vector{Tuple}`, ….
+#
+# `env` is the stack of TypeVars bound by the enclosing "where" descriptors, innermost
+# last. A "typevar" reference resolves to the innermost binding with that name.
 # ---------------------------------------------------------------------------
 
-# A type parameter is either a Type or a bits value (Int, Symbol, Bool, ...).
-function _param_desc(@nospecialize(p), ctx::SerdeContext)
-    if p isa Type
-        return Dict{String,Any}("type" => _type_desc(p, ctx))
+# Anything `_type_desc` can describe, i.e. what can sit in a parameter list as a type.
+_is_typeish(@nospecialize(p)) = p isa Type || p isa TypeVar || p isa Core.TypeofVararg
+
+# A type parameter is either type-like (Type, TypeVar, Vararg) or a bits value
+# (Int, Symbol, Bool, ...).
+function _param_desc(@nospecialize(p), ctx::SerdeContext, env::Vector{TypeVar} = TypeVar[])
+    if _is_typeish(p)
+        return Dict{String,Any}("type" => _type_desc(p, ctx, env))
     else
         # A value used as a type parameter; self-describe it fully.
         return Dict{String,Any}("value" => encode(p, Any, ctx))
     end
 end
 
-function _type_desc(@nospecialize(T), ctx::SerdeContext)
+# A bare UnionAll wrapper (`Vector`, `Circle`) is the binding of its own name in its module.
+function _is_bare_wrapper(@nospecialize(T::UnionAll))
+    m, n = parentmodule(T), nameof(T)
+    return isdefined(m, n) && getfield(m, n) === T
+end
+
+function _type_desc(@nospecialize(T), ctx::SerdeContext, env::Vector{TypeVar} = TypeVar[])
     if T === Union{}
         return Dict{String,Any}("name" => "Bottom", "module" => "Core", "params" => Any[])
-    elseif T isa UnionAll
-        # Only the bare wrapper form (e.g. `Newton`, `Vector`) is supported; that
-        # resolves back through the allowlist by name with no parameters.
-        if !(T === getfield(parentmodule(T), nameof(T)))
+    elseif T isa TypeVar
+        # The innermost binding with this name must be this very TypeVar; otherwise the
+        # variable is free, or an outer one shadowed by a namesake, and a name alone
+        # cannot say which binding it refers to.
+        idx = findlast(tv -> tv.name === T.name, env)
+        if idx === nothing || env[idx] !== T
             error(
-                "TypeAgnosticSerialisation: partially-applied UnionAll $(T) is unsupported. " *
-                "If it lives inside a live / non-data object (e.g. a solver model), " *
-                "mark that object's type opaque, e.g. opaque = (JuMP.Model,).",
+                "TypeAgnosticSerialisation: type variable $(T) is free or shadowed by an " *
+                "inner variable of the same name; it cannot be serialised by name.",
             )
         end
+        return Dict{String,Any}("typevar" => String(T.name))
+    elseif T isa Core.TypeofVararg
+        d = Dict{String,Any}("vararg" => _type_desc(isdefined(T, :T) ? T.T : Any, ctx, env))
+        if isdefined(T, :N)
+            d["count"] = _param_desc(T.N, ctx, env)
+        end
+        return d
+    elseif T isa Union
         return Dict{String,Any}(
-            "name" => string(nameof(T)),
-            "module" => string(parentmodule(T)),
-            "params" => Any[],
+            "union" => Any[_type_desc(U, ctx, env) for U in Base.uniontypes(T)],
         )
+    elseif T isa UnionAll
+        if _is_bare_wrapper(T)
+            # Compact, readable form; resolves back through the allowlist by name.
+            return Dict{String,Any}(
+                "name" => string(nameof(T)),
+                "module" => string(parentmodule(T)),
+                "params" => Any[],
+            )
+        end
+        tv = T.var
+        # The bounds are in the scope of the enclosing variables only, not of `tv`.
+        var = Dict{String,Any}(
+            "var" => String(tv.name),
+            "lb" => _type_desc(tv.lb, ctx, env),
+            "ub" => _type_desc(tv.ub, ctx, env),
+        )
+        push!(env, tv)
+        try
+            return Dict{String,Any}("where" => var, "body" => _type_desc(T.body, ctx, env))
+        finally
+            pop!(env)
+        end
     elseif T isa DataType
         return Dict{String,Any}(
             "name" => string(nameof(T)),
             "module" => string(parentmodule(T)),
-            "params" => Any[_param_desc(p, ctx) for p in T.parameters],
+            "params" => Any[_param_desc(p, ctx, env) for p in T.parameters],
         )
     else
-        # UnionAll / Union type parameters (e.g. Vector{Vector}) are an extension
-        # point — the estimator use case has fully concrete parameters.
         error(
-            "TypeAgnosticSerialisation: unsupported non-concrete type parameter $(T)::$(typeof(T)). " *
+            "TypeAgnosticSerialisation: unsupported type parameter $(T)::$(typeof(T)). " *
             "Add a rule in _type_desc/_resolve_type if you need it.",
         )
     end
@@ -195,15 +254,44 @@ function _lookup_module(modname::AbstractString, ctx::SerdeContext)
     )
 end
 
-function _resolve_param(p, ctx::SerdeContext)
+function _resolve_param(p, ctx::SerdeContext, env::Vector{TypeVar} = TypeVar[])
     if haskey(p, "type")
-        return _resolve_type(p["type"], ctx)
+        return _resolve_type(p["type"], ctx, env)
     else
         return decode(p["value"], Any, ctx)
     end
 end
 
-function _resolve_type(desc, ctx::SerdeContext)
+function _resolve_type(desc, ctx::SerdeContext, env::Vector{TypeVar} = TypeVar[])
+    if haskey(desc, "typevar")
+        name = Symbol(desc["typevar"])
+        idx = findlast(tv -> tv.name === name, env)
+        if idx === nothing
+            error("TypeAgnosticSerialisation: type variable $(name) is not bound.")
+        end
+        return env[idx]
+    elseif haskey(desc, "vararg")
+        T = _resolve_type(desc["vararg"], ctx, env)
+        if haskey(desc, "count")
+            return Vararg{T,_resolve_param(desc["count"], ctx, env)}
+        else
+            return Vararg{T}
+        end
+    elseif haskey(desc, "union")
+        return Union{Any[_resolve_type(d, ctx, env) for d in desc["union"]]...}
+    elseif haskey(desc, "where")
+        var = desc["where"]
+        lb = _resolve_type(var["lb"], ctx, env)
+        ub = _resolve_type(var["ub"], ctx, env)
+        tv = TypeVar(Symbol(var["var"]), lb, ub)
+        push!(env, tv)
+        body = try
+            _resolve_type(desc["body"], ctx, env)
+        finally
+            pop!(env)
+        end
+        return UnionAll(tv, body)
+    end
     if desc["name"] == "Bottom"
         return Union{}
     end
@@ -218,14 +306,15 @@ function _resolve_type(desc, ctx::SerdeContext)
     if !(base isa Type)
         error("TypeAgnosticSerialisation: $(desc["module"]).$(desc["name"]) is not a type.")
     end
-    params = Any[_resolve_param(p, ctx) for p in desc["params"]]
+    params = Any[_resolve_param(p, ctx, env) for p in desc["params"]]
     if !isempty(params)
         return Core.apply_type(base, params...)
     else
         # Zero params: a leaf DataType (Symbol, Int64, Nothing) or a bare UnionAll
         # (Newton, Vector) resolves to `base` as-is — `apply_type` would error on
         # leaves. The one exception is the empty tuple type, whose `getfield` result
-        # is the *abstract* `Tuple`, not the concrete `Tuple{}`.
+        # is the *abstract* `Tuple`, not the concrete `Tuple{}`. (The abstract `Tuple`
+        # is `Tuple{Vararg{Any}}`, so it always carries its Vararg parameter.)
         return base === Tuple ? Tuple{} : base
     end
 end
@@ -242,8 +331,10 @@ end
 #
 #   * _construct_safe (VALIDATED): call the type's own constructor so all validation
 #     runs — positional in declaration order first (the canonical form for `@concrete`
-#     inner ctors and Base types), keyword-by-field-name as a fallback. Fails loudly on
-#     types whose constructor cannot be replayed from its fields.
+#     inner ctors and Base types), keyword-by-field-name as a fallback. If that
+#     constructor re-derives different type parameters from the field values (e.g.
+#     `Pair(1, "a")` for a `Pair{Int,Any}`), the value is rebuilt at the exact type.
+#     Fails loudly on types whose constructor cannot be replayed from its fields.
 # ---------------------------------------------------------------------------
 
 # Generated: `new(T, fields[1], …, fields[n])`. `T` here is the static parameter.
@@ -263,6 +354,34 @@ function _newbuild(@nospecialize(T::DataType), fields::Vector{Any})
 end
 
 function _construct_safe(@nospecialize(T::DataType), fields::Vector{Any})
+    x = _construct_via_wrapper(T, fields)
+    if typeof(x) === T
+        return x
+    end
+    # The constructor ran (so its validation passed on these very field values) but
+    # re-derived *different* type parameters from them: `Pair(1, "a")` is a
+    # `Pair{Int,String}`, not the `Pair{Int,Any}` that was encoded. Rebuild at the exact
+    # type — through the parameterised constructor, else by `convert`.
+    y = try
+        T(fields...)
+    catch
+        try
+            convert(T, x)
+        catch
+            nothing
+        end
+    end
+    if typeof(y) === T
+        return y
+    end
+    return error(
+        "TypeAgnosticSerialisation (validate): the constructor of $(T) built a " *
+        "$(typeof(x)) instead, and neither `$(T)(fields...)` nor `convert($(T), …)` " *
+        "gives the exact type. Mark the type opaque or use `from_json_direct`.",
+    )
+end
+
+function _construct_via_wrapper(@nospecialize(T::DataType), fields::Vector{Any})
     base = T.name.wrapper   # unparameterised type: its ctor rederives the parameters
     # Positional in declaration order is the canonical constructor for `@concrete`
     # structs (its validating inner ctor) and for most Base types (Day, TwicePrecision,
@@ -535,68 +654,6 @@ function _decode_number(@nospecialize(T), payload)
     end
 end
 
-# ---------------------------------------------------------------------------
-# Text layer (the only JSON-coupled part).
-# ---------------------------------------------------------------------------
-
-"""
-    to_json(value; modules = (), opaque = (), kwargs...) -> String
-
-Serialise `value` to a JSON string that carries enough type metadata to rebuild the exact
-concrete type later — without knowing the type up front. Equivalent to `encode` followed
-by `JSON.json`; any extra `kwargs` (e.g. `pretty = 2`) are forwarded to `JSON.json`.
-
-`modules` is the allowlist recorded for the human reader's benefit and used when the
-argument list is shared with the loaders — pass the module(s) that define your types (a
-bare `Module` is fine). `opaque` lists types to skip structurally (see
-[`SerdeContext`](@ref)); encoding a live, non-data value that is *not* marked opaque fails
-loudly rather than emitting a broken artifact.
-
-Read back with [`from_json`](@ref) (validated) or [`from_json_direct`](@ref).
-"""
-function to_json(x; modules = (), opaque = (), kwargs...)
-    tree = encode(x, SerdeContext(modules; opaque = opaque))
-    return JSON.json(tree; kwargs...)
-end
-
-"""
-    from_json(str; modules = (), opaque = ()) -> value
-
-Read a JSON string produced by [`to_json`](@ref) back into a Julia value, **validated**:
-every struct is rebuilt through its own constructor, so all inner-constructor /
-`@argcheck` invariants run and a tampered or inconsistent document is refused. This is the
-recommended, default loader.
-
-It requires a constructor that can be replayed from the fields — positional in declaration
-order, or keyword by field name. A type whose constructor cannot be replayed fails loudly;
-mark it `opaque` or use [`from_json_direct`](@ref) for those. `modules` is the resolution
-allowlist (a bare `Module` is accepted); only types reachable from it — plus the
-always-present `Base`/`Core` — can be named.
-
-See also [`from_json_direct`](@ref) for the non-validating counterpart.
-"""
-function from_json(str::AbstractString; modules = (), opaque = ())
-    tree = JSON.parse(str; dicttype = Dict{String,Any})
-    return decode(tree, SerdeContext(modules; opaque = opaque, validate = true))
-end
-
-"""
-    from_json_direct(str; modules = (), opaque = ()) -> value
-
-Read a JSON string produced by [`to_json`](@ref) back into a Julia value, **directly**:
-each struct is built field-by-field with Julia's own `new` (via `Expr(:new)`), bypassing
-all constructors. This reconstructs *any* struct — even one with no usable constructor —
-and is still type-safe (`new` type-checks and converts every field against its declared
-type, so a mismatch throws and can never corrupt memory), but it runs **no** user
-validation.
-
-Use it for JSON you produced and trust, or for types whose constructor cannot be replayed
-from its fields. When you want invariants enforced on load, use [`from_json`](@ref)
-instead. `modules`/`opaque` behave exactly as for [`from_json`](@ref).
-"""
-function from_json_direct(str::AbstractString; modules = (), opaque = ())
-    tree = JSON.parse(str; dicttype = Dict{String,Any})
-    return decode(tree, SerdeContext(modules; opaque = opaque, validate = false))
-end
+include("formats.jl")
 
 end # module
