@@ -17,7 +17,7 @@ import JSON, MsgPack, TOML, YAML
 module TestSerdeModule
 
 export AbstractShape, Circle, Rect, Square, Color, red, green, blue
-export Scene, Doc, KwOnly, Handle, NoDefault
+export Scene, Doc, KwOnly, Handle, NoDefault, Loose
 
 abstract type AbstractShape end
 
@@ -72,6 +72,13 @@ end
 # Opaque type with no zero-argument constructor -> `_construct_opaque` must fail loudly.
 struct NoDefault
     x::Int
+end
+
+# Only an unparameterised constructor, which always derives `T` from the field: a
+# `Loose{Real}` (built with `new`) cannot be rebuilt at its exact type by `_construct_safe`.
+struct Loose{T}
+    x::T
+    Loose(x::T) where {T} = new{T}(x)
 end
 
 end # module TestSerdeModule

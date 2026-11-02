@@ -148,6 +148,30 @@ end
     @test broken.r == -7.0
 end
 
+@testset "validated rebuild at the exact type parameters" begin
+    # The unparameterised constructor re-derives narrower parameters from the field values
+    # (`Pair(1, "a")` is a `Pair{Int,String}`); the value must come back at the encoded type.
+    for x in Any[
+        Pair{Int,Any}(1, "a"),
+        Pair{Real,AbstractString}(1, "x"),
+        Vector{Pair{<:Integer}}([1 => "a", 0x02 => 3]),
+        Circle{Real}(1),
+        Some{Any}(1),
+    ]
+        r = roundtrip(x; modules = (M,), validate = true)
+        @test r.ok_tree
+        @test r.ok_text
+    end
+    # Validation still runs first: a negative radius is refused even at `Circle{Real}`.
+    ctx = SerdeContext((M,))
+    bad = encode(TypeAgnosticSerialisation._newbuild(Circle{Real}, Any[-1]), ctx)
+    @test_throws ErrorException decode(bad, SerdeContext((M,); validate = true))
+    # No parameterised constructor and no `convert` -> fail loudly, not a wrong type.
+    loose = encode(TypeAgnosticSerialisation._newbuild(Loose{Real}, Any[1]), ctx)
+    @test_throws ErrorException decode(loose, SerdeContext((M,); validate = true))
+    @test decode(loose, ctx) isa Loose{Real}   # direct mode builds it with `new`
+end
+
 @testset "keyword-fallback constructor (KwOnly)" begin
     x = KwOnly(; a = 1, b = 2)
     for v in (false, true)

@@ -331,8 +331,10 @@ end
 #
 #   * _construct_safe (VALIDATED): call the type's own constructor so all validation
 #     runs — positional in declaration order first (the canonical form for `@concrete`
-#     inner ctors and Base types), keyword-by-field-name as a fallback. Fails loudly on
-#     types whose constructor cannot be replayed from its fields.
+#     inner ctors and Base types), keyword-by-field-name as a fallback. If that
+#     constructor re-derives different type parameters from the field values (e.g.
+#     `Pair(1, "a")` for a `Pair{Int,Any}`), the value is rebuilt at the exact type.
+#     Fails loudly on types whose constructor cannot be replayed from its fields.
 # ---------------------------------------------------------------------------
 
 # Generated: `new(T, fields[1], …, fields[n])`. `T` here is the static parameter.
@@ -352,6 +354,34 @@ function _newbuild(@nospecialize(T::DataType), fields::Vector{Any})
 end
 
 function _construct_safe(@nospecialize(T::DataType), fields::Vector{Any})
+    x = _construct_via_wrapper(T, fields)
+    if typeof(x) === T
+        return x
+    end
+    # The constructor ran (so its validation passed on these very field values) but
+    # re-derived *different* type parameters from them: `Pair(1, "a")` is a
+    # `Pair{Int,String}`, not the `Pair{Int,Any}` that was encoded. Rebuild at the exact
+    # type — through the parameterised constructor, else by `convert`.
+    y = try
+        T(fields...)
+    catch
+        try
+            convert(T, x)
+        catch
+            nothing
+        end
+    end
+    if typeof(y) === T
+        return y
+    end
+    return error(
+        "TypeAgnosticSerialisation (validate): the constructor of $(T) built a " *
+        "$(typeof(x)) instead, and neither `$(T)(fields...)` nor `convert($(T), …)` " *
+        "gives the exact type. Mark the type opaque or use `from_json_direct`.",
+    )
+end
+
+function _construct_via_wrapper(@nospecialize(T::DataType), fields::Vector{Any})
     base = T.name.wrapper   # unparameterised type: its ctor rederives the parameters
     # Positional in declaration order is the canonical constructor for `@concrete`
     # structs (its validating inner ctor) and for most Base types (Day, TwicePrecision,
