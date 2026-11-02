@@ -8,11 +8,15 @@
 [![Docs workflow Status](https://github.com/dcelisgarza/TypeAgnosticSerialisation.jl/actions/workflows/Docs.yml/badge.svg?branch=main)](https://github.com/dcelisgarza/TypeAgnosticSerialisation.jl/actions/workflows/Docs.yml?query=branch%3Amain)
 [![BestieTemplate](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/JuliaBesties/BestieTemplate.jl/main/docs/src/assets/badge.json)](https://github.com/JuliaBesties/BestieTemplate.jl)
 
-**TypeAgnosticSerialisation** serialises an arbitrary Julia value to JSON and reconstructs it later
-*without knowing its type up front*. The JSON carries enough type metadata — the full
-concrete type, including type parameters, recursively — to rebuild the exact concrete type
-tree. That is what lets a field declared `::AbstractShape` come back as the precise
-`Circle{Float64}` you put in.
+**TypeAgnosticSerialisation** serialises an arbitrary Julia value to JSON, YAML, TOML or
+MessagePack and reconstructs it later *without knowing its type up front*. The document
+carries enough type metadata — the full concrete type, including type parameters,
+recursively — to rebuild the exact concrete type tree. That is what lets a field declared
+`::AbstractShape` come back as the precise `Circle{Float64}` you put in.
+
+The package itself has **no dependencies**: it lowers a value to a plain tree and back.
+Each format is a package extension that activates when you load its backend package (see
+*Formats* below).
 
 Type resolution is gated by a **module allowlist**: a `__type__` tag may only name a type
 reachable from a module you explicitly trust. There is no `eval` of strings from the
@@ -23,6 +27,7 @@ document.
 ```julia
 using Pkg
 Pkg.add("TypeAgnosticSerialisation")
+Pkg.add("JSON")   # or YAML / MsgPack; TOML is a standard library
 ```
 
 ## A worked example
@@ -32,10 +37,12 @@ Everything below is a runnable, tested example. First, a small self-contained se
 `Square` is a singleton; `Color` is an `@enum`; and `Handle` wraps a raw pointer — a
 stand-in for a live, non-data object. `Scene` ties them together, holding a heterogeneous
 `Vector{AbstractShape}`. All the names are exported so they can be used unqualified after
-`using .Shapes`:
+`using .Shapes`. Loading `JSON` activates the JSON format:
 
 ```julia
 julia> using TypeAgnosticSerialisation
+
+julia> import JSON
 
 julia> module Shapes
            export AbstractShape, Circle, Rect, Square, Color, red, green, blue, Scene, Handle, Doc
@@ -209,16 +216,70 @@ julia> decode(tree, ctx).r
 2.0
 ```
 
-### A different text layer (TOML)
+## Formats
 
-Because the core is text-agnostic, you can serialise the plain tree through any format, not
-just JSON. When the type is known at the call site (a concrete `hint`), `encode` emits a
-bare structural payload with no envelope — for `Rect` that is a plain table, which round-
-trips cleanly through TOML:
+Every format writes the same plain tree, so every format carries the same type metadata,
+honours the same `modules` allowlist and `opaque` list, and has the same validated /
+direct pair of loaders. Each one is a package extension: load the backend package and its
+three functions start working. Until then they fail with a message naming the package to
+load.
+
+| Format      | Load first       | Write          | Read (validated) | Read (direct)         |
+|:----------- |:---------------- |:-------------- |:---------------- |:--------------------- |
+| JSON        | `import JSON`    | `to_json`      | `from_json`      | `from_json_direct`    |
+| YAML        | `import YAML`    | `to_yaml`      | `from_yaml`      | `from_yaml_direct`    |
+| TOML        | `import TOML`    | `to_toml`      | `from_toml`      | `from_toml_direct`    |
+| MessagePack | `import MsgPack` | `to_msgpack`   | `from_msgpack`   | `from_msgpack_direct` |
+
+JSON, YAML and TOML produce a `String`; MessagePack produces compact `Vector{UInt8}` bytes.
+The same scene round-trips through each of them:
 
 ```julia
-julia> import TOML
+julia> import YAML, TOML, MsgPack
 
+julia> yaml = to_yaml(scene; modules = Shapes);
+
+julia> from_yaml(yaml; modules = Shapes).shapes[1] isa Circle{Float64}
+true
+
+julia> toml = to_toml(scene; modules = Shapes);
+
+julia> from_toml(toml; modules = Shapes).shapes[2] isa Rect{Int}
+true
+
+julia> bytes = to_msgpack(scene; modules = Shapes);
+
+julia> bytes isa Vector{UInt8}
+true
+
+julia> from_msgpack(bytes; modules = Shapes).bg === green
+true
+```
+
+A few format-specific notes:
+
+- **YAML**: every string is written quoted, so a string such as `"true"`, `"null"` or
+  `"2024-01-01"` is never re-read as another type. A document that uses YAML
+  anchors/aliases is refused: `to_yaml` never writes them, and an alias lets a tiny
+  document expand into an exponentially large tree.
+- **TOML**: the top level is always the tagged envelope, so it is always a valid TOML
+  table. Extra keyword arguments (e.g. `sorted = true`) go to `TOML.print`.
+- **MessagePack**: there is no 16-bit float, so a `Float16` is stored as the exactly-equal
+  `Float32` and narrowed back on load. MessagePack extension values are never
+  deserialised.
+
+CBOR is deliberately not offered: `CBOR.jl` passes tagged data from the document to
+`Serialization.deserialize`, which would let a document build arbitrary Julia objects
+behind the back of the module allowlist.
+
+### Bringing your own format
+
+Because the core is format-agnostic, you can also serialise the plain tree through any
+other library yourself. When the type is known at the call site (a concrete `hint`),
+`encode` emits a bare structural payload with no envelope — for `Rect` that is a plain
+table, which round-trips cleanly through `TOML` directly:
+
+```julia
 julia> payload = encode(Rect(3, 4), Rect{Int}, ctx);   # concrete hint -> no envelope
 
 julia> io = IOBuffer(); TOML.print(io, payload); s = String(take!(io));
@@ -231,7 +292,7 @@ julia> (rt.w, rt.h)
 
 ## Reserved keys and limitations
 
-The envelope reserves a handful of JSON keys: `"__type__"`, `"__value__"` (the tagged
+The envelope reserves a handful of tree keys: `"__type__"`, `"__value__"` (the tagged
 envelope); `"type"`/`"value"` (type-parameter wrappers); `"size"`/`"data"` (arrays);
 `"pairs"` (dicts); `"names"`/`"values"` (named tuples); and `"__opaque__"` (opaque
 placeholders). A struct field literally named `__type__` would collide — a documented
@@ -239,7 +300,7 @@ limitation. `#undef` fields are unsupported and are reported rather than silentl
 
 ## Reference
 
-Every exported function — `to_json`, `from_json`,
-`from_json_direct`, `encode`, `decode` and `SerdeContext` —
-is documented in full in the Reference section of the online
+Every exported function — the `to_*` / `from_*` / `from_*_direct` family for each format
+(e.g. `to_json`, `from_yaml`, `from_msgpack_direct`),
+`encode`, `decode` and `SerdeContext` — is documented in full in the Reference section of the online
 documentation.

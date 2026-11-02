@@ -1,7 +1,8 @@
 # TypeAgnosticSerialisation — type-tagged (de)serialisation of arbitrary Julia values.
 #
-# Goal: serialise a Julia value to JSON and reconstruct it later *without* knowing
-# its type up front. The JSON carries enough type metadata to rebuild the exact
+# Goal: serialise a Julia value to a portable document (JSON, YAML, TOML, MessagePack)
+# and reconstruct it later *without* knowing its type up front. The document carries
+# enough type metadata to rebuild the exact
 # concrete type tree.
 #
 # Design decisions (from the design conversation):
@@ -37,20 +38,25 @@
 # Layering:
 #   encode(x, ctx)              :: value  -> plain tree (Dict/Vector/scalars) [no deps]
 #   decode(tree, ctx)           :: tree   -> value                           [no deps]
-#   to_json(x; modules)         :: value  -> String                          [JSON]
-#   from_json(str; modules)     :: String -> value  (validated, default)     [JSON]
-#   from_json_direct(str; …)    :: String -> value  (direct `new`, no valid.)[JSON]
+#   to_<fmt>(x; modules)        :: value  -> String/bytes                    [extension]
+#   from_<fmt>(data; modules)   :: data   -> value  (validated, default)     [extension]
+#   from_<fmt>_direct(data; …)  :: data   -> value  (direct `new`, no valid.)[extension]
 #
-# Reserved JSON keys: "__type__", "__value__" (tagged envelope); "type"/"value"
+# The package itself carries only the tree. Each format (JSON, YAML, TOML, MessagePack)
+# is a package extension in `ext/` that loads with its backend package; see formats.jl.
+#
+# Reserved tree keys: "__type__", "__value__" (tagged envelope); "type"/"value"
 # (type-parameter wrappers); "size"/"data" (arrays); "pairs" (dicts);
 # "names"/"values" (named tuples). A struct field literally named "__type__" would
 # collide — documented limitation.
 
 module TypeAgnosticSerialisation
 
-using JSON: JSON   # only used by to_json/from_json; core encode/decode need no deps
-
-export SerdeContext, encode, decode, to_json, from_json, from_json_direct
+export SerdeContext, encode, decode
+export to_json, from_json, from_json_direct
+export to_yaml, from_yaml, from_yaml_direct
+export to_toml, from_toml, from_toml_direct
+export to_msgpack, from_msgpack, from_msgpack_direct
 
 # ---------------------------------------------------------------------------
 # Context: the module allowlist for type resolution.
@@ -535,68 +541,6 @@ function _decode_number(@nospecialize(T), payload)
     end
 end
 
-# ---------------------------------------------------------------------------
-# Text layer (the only JSON-coupled part).
-# ---------------------------------------------------------------------------
-
-"""
-    to_json(value; modules = (), opaque = (), kwargs...) -> String
-
-Serialise `value` to a JSON string that carries enough type metadata to rebuild the exact
-concrete type later — without knowing the type up front. Equivalent to `encode` followed
-by `JSON.json`; any extra `kwargs` (e.g. `pretty = 2`) are forwarded to `JSON.json`.
-
-`modules` is the allowlist recorded for the human reader's benefit and used when the
-argument list is shared with the loaders — pass the module(s) that define your types (a
-bare `Module` is fine). `opaque` lists types to skip structurally (see
-[`SerdeContext`](@ref)); encoding a live, non-data value that is *not* marked opaque fails
-loudly rather than emitting a broken artifact.
-
-Read back with [`from_json`](@ref) (validated) or [`from_json_direct`](@ref).
-"""
-function to_json(x; modules = (), opaque = (), kwargs...)
-    tree = encode(x, SerdeContext(modules; opaque = opaque))
-    return JSON.json(tree; kwargs...)
-end
-
-"""
-    from_json(str; modules = (), opaque = ()) -> value
-
-Read a JSON string produced by [`to_json`](@ref) back into a Julia value, **validated**:
-every struct is rebuilt through its own constructor, so all inner-constructor /
-`@argcheck` invariants run and a tampered or inconsistent document is refused. This is the
-recommended, default loader.
-
-It requires a constructor that can be replayed from the fields — positional in declaration
-order, or keyword by field name. A type whose constructor cannot be replayed fails loudly;
-mark it `opaque` or use [`from_json_direct`](@ref) for those. `modules` is the resolution
-allowlist (a bare `Module` is accepted); only types reachable from it — plus the
-always-present `Base`/`Core` — can be named.
-
-See also [`from_json_direct`](@ref) for the non-validating counterpart.
-"""
-function from_json(str::AbstractString; modules = (), opaque = ())
-    tree = JSON.parse(str; dicttype = Dict{String,Any})
-    return decode(tree, SerdeContext(modules; opaque = opaque, validate = true))
-end
-
-"""
-    from_json_direct(str; modules = (), opaque = ()) -> value
-
-Read a JSON string produced by [`to_json`](@ref) back into a Julia value, **directly**:
-each struct is built field-by-field with Julia's own `new` (via `Expr(:new)`), bypassing
-all constructors. This reconstructs *any* struct — even one with no usable constructor —
-and is still type-safe (`new` type-checks and converts every field against its declared
-type, so a mismatch throws and can never corrupt memory), but it runs **no** user
-validation.
-
-Use it for JSON you produced and trust, or for types whose constructor cannot be replayed
-from its fields. When you want invariants enforced on load, use [`from_json`](@ref)
-instead. `modules`/`opaque` behave exactly as for [`from_json`](@ref).
-"""
-function from_json_direct(str::AbstractString; modules = (), opaque = ())
-    tree = JSON.parse(str; dicttype = Dict{String,Any})
-    return decode(tree, SerdeContext(modules; opaque = opaque, validate = false))
-end
+include("formats.jl")
 
 end # module
