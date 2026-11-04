@@ -172,6 +172,17 @@ end
     @test decode(loose, ctx) isa Loose{Real}   # direct mode builds it with `new`
 end
 
+@testset "named function as a value (validate=$v)" for v in (false, true)
+    # The type of a named function is a singleton with no constructor. The validated
+    # decode gives back its one instance, the function itself.
+    for x in Any[bump, Smoother(bump, 0.5), Any[bump, sin]]
+        r = roundtrip(x; modules = (M,), validate = v)
+        @test r.ok_tree
+        @test r.ok_text
+    end
+    @test roundtrip(Smoother(bump, 0.5); modules = (M,), validate = v).text.kernel === bump
+end
+
 @testset "keyword-fallback constructor (KwOnly)" begin
     x = KwOnly(; a = 1, b = 2)
     for v in (false, true)
