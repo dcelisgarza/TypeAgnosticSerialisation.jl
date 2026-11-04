@@ -17,7 +17,7 @@ import JSON, MsgPack, TOML, YAML
 module TestSerdeModule
 
 export AbstractShape, Circle, Rect, Square, Color, red, green, blue
-export Scene, Doc, KwOnly, Handle, NoDefault, Loose
+export Scene, Doc, KwOnly, Handle, NoDefault, Loose, Smoother, bump
 
 abstract type AbstractShape end
 
@@ -79,6 +79,15 @@ end
 struct Loose{T}
     x::T
     Loose(x::T) where {T} = new{T}(x)
+end
+
+# A named function as a field value: its type `typeof(bump)` is a singleton with no
+# constructor, so `_construct_safe` must give back its one instance.
+bump(u) = exp(-u^2 / 2)
+
+struct Smoother{F}
+    kernel::F
+    width::Float64
 end
 
 end # module TestSerdeModule

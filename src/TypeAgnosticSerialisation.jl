@@ -354,6 +354,9 @@ function _newbuild(@nospecialize(T::DataType), fields::Vector{Any})
 end
 
 function _construct_safe(@nospecialize(T::DataType), fields::Vector{Any})
+    # The type of a named function, such as `typeof(sin)`, is a singleton with no
+    # constructor. Its one value is the function, so there is no validation to replay.
+    T <: Function && Base.issingletontype(T) && return T.instance
     x = _construct_via_wrapper(T, fields)
     if typeof(x) === T
         return x
