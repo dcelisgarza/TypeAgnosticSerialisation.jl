@@ -35,7 +35,8 @@
 #     and containers resolve (`Float64`, `Symbol`, `Array`, `Dict`, ...) unless the
 #     caller lists the module; the caller adds the modules that define their own types,
 #     e.g. `PortfolioOptimisers`, `StatsBase`. A named function decodes only if the
-#     caller lists it in `functions`, and a dict decodes only into `Dict` or `IdDict`.
+#     caller lists it in `functions`, and a dict decodes only into `Dict`, `IdDict` or a
+#     dict type that the caller lists in `dicts`.
 #
 # Layering:
 #   encode(x, ctx)              :: value  -> plain tree (Dict/Vector/scalars) [no deps]
@@ -66,11 +67,11 @@ export to_msgpack, from_msgpack, from_msgpack_direct
 # ---------------------------------------------------------------------------
 
 """
-    SerdeContext(modules; opaque = (), functions = (), validate = false)
-    SerdeContext(single_module::Module; opaque = (), functions = (), validate = false)
-    SerdeContext(; modules = (), opaque = (), functions = (), validate = false)
+    SerdeContext(modules; opaque = (), functions = (), dicts = (), validate = false)
+    SerdeContext(single_module::Module; opaque = (), functions = (), dicts = (), validate = false)
+    SerdeContext(; modules = (), opaque = (), functions = (), dicts = (), validate = false)
 
-The state threaded through every [`encode`](@ref)/[`decode`](@ref) call. It holds four
+The state threaded through every [`encode`](@ref)/[`decode`](@ref) call. It holds five
 things:
 
   - `modules`: the **allowlist** used to resolve `__type__` tags back to concrete types. A
@@ -85,6 +86,10 @@ things:
     subtype of `Function` — a named function such as `sin`, or an anonymous function with
     no captures — decodes only if it is in this list, in both decode modes and from any
     module, listed or not. The default is empty: no function decodes.
+  - `dicts`: the dict types, other than `Dict` and `IdDict`, that may decode. Name each
+    by its type, such as `OrderedDict`; the name admits every parameterisation of it. The
+    type must still be defined in a module of `modules`. The default is empty: a dict
+    decodes only into `Dict` or `IdDict`.
   - `opaque`: a collection of types that are **not** serialised structurally. A value
     whose type is (a subtype of) one of these is replaced by a placeholder on encode and
     rebuilt with its no-argument constructor `T()` on decode. Use it for live, non-data
@@ -94,9 +99,10 @@ things:
     constructor (running all validation); `false` builds directly with Julia's `new`
     (no validation). See [`from_json`](@ref) and [`from_json_direct`](@ref).
 
-A dict decodes only into `Dict` or `IdDict`, even when `Base` is listed: the decode calls
-`T()` and `setindex!`, and another dict type (such as the type of `ENV`) can act on the
-system.
+A dict decodes only into `Dict`, `IdDict` or a type of `dicts`, even when `Base` is listed:
+the decode calls `T()` and `setindex!` with the keys and values of the document, and another
+dict type (such as the type of `ENV`) can act on the system. Name in `dicts` only types
+whose `setindex!` only stores data.
 
 You rarely build one by hand — [`to_json`](@ref), [`from_json`](@ref) and
 [`from_json_direct`](@ref) construct it for you from the same keyword arguments.
@@ -113,10 +119,39 @@ struct SerdeContext
     opaque::Vector{Any}            # types serialised as a placeholder, rebuilt via T()
     functions::Vector{Any}         # the singleton functions that may decode
     function_types::Dict{Tuple{String,String},DataType}  # (module, name) => typeof(f)
+    dicts::Base.IdSet{Any}         # wrappers of the dict types that may decode
     validate::Bool                 # decode: true = via constructor; false = direct `new`
 end
 
-function SerdeContext(mods; opaque = (), functions = (), validate::Bool = false)
+# The positional form of v0.3.0, which had no `dicts` field.
+function SerdeContext(modules, plain_only, opaque, functions, function_types, validate)
+    dicts = Base.IdSet{Any}(_PLAIN_DICTS)
+    return SerdeContext(
+        modules,
+        plain_only,
+        opaque,
+        functions,
+        function_types,
+        dicts,
+        validate,
+    )
+end
+
+function _dict_set(dicts)
+    s = Base.IdSet{Any}(_PLAIN_DICTS)
+    for D in dicts
+        if !(D isa Type && D <: AbstractDict)
+            error(
+                "TypeAgnosticSerialisation: `dicts` holds $(repr(D)), which is not a " *
+                "subtype of `AbstractDict`.",
+            )
+        end
+        push!(s, _wrapper(D))
+    end
+    return s
+end
+
+function SerdeContext(mods; opaque = (), functions = (), dicts = (), validate::Bool = false)
     listed = collect(Module, mods)
     d = Dict{String,Module}()
     for m in (Base, Core, listed...)
@@ -135,20 +170,16 @@ function SerdeContext(mods; opaque = (), functions = (), validate::Bool = false)
         end
         ftypes[(string(parentmodule(F)), string(nameof(F)))] = F
     end
-    return SerdeContext(d, plain_only, collect(Any, opaque), fs, ftypes, validate)
+    ds = _dict_set(dicts)
+    return SerdeContext(d, plain_only, collect(Any, opaque), fs, ftypes, ds, validate)
 end
 # A single module is the common case; accept it without asking the caller to wrap it in a
 # one-tuple (`modules = MyPkg` rather than `modules = (MyPkg,)`).
-function SerdeContext(m::Module; opaque = (), functions = (), validate::Bool = false)
-    return SerdeContext((m,); opaque = opaque, functions = functions, validate = validate)
+function SerdeContext(m::Module; kwargs...)
+    return SerdeContext((m,); kwargs...)
 end
-function SerdeContext(; modules = (), opaque = (), functions = (), validate::Bool = false)
-    return SerdeContext(
-        modules;
-        opaque = opaque,
-        functions = functions,
-        validate = validate,
-    )
+function SerdeContext(; modules = (), kwargs...)
+    return SerdeContext(modules; kwargs...)
 end
 
 # ---------------------------------------------------------------------------
@@ -783,10 +814,11 @@ function _decode_plain(payload, @nospecialize(T), ctx::SerdeContext)
         flat = isempty(data) ? Array{el}(undef, 0) : convert(Vector{el}, data)
         return convert(T, reshape(flat, sz))
     elseif T <: AbstractDict
-        if !(_wrapper(T) in _PLAIN_DICTS)
+        if !(_wrapper(T) in ctx.dicts)
             error(
                 "TypeAgnosticSerialisation: the dict type $(T) is not in the allowlist; " *
-                "a dict decodes only into `Dict` or `IdDict`.",
+                "a dict decodes only into `Dict`, `IdDict` or a type of `dicts`. Pass it " *
+                "via `dicts = (…, $(nameof(_wrapper(T))), …)`.",
             )
         end
         K, V = keytype(T), valtype(T)

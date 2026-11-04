@@ -193,8 +193,18 @@ julia> from_json(js; functions = (sin,)).kernel === sin
 true
 ```
 
-A dict decodes only into `Dict` or `IdDict`: the decode calls `setindex!` on the new dict,
-and another dict type can act on the system.
+### Other dict types with `dicts`
+
+A dict decodes into `Dict` or `IdDict`. To decode into another dict type, such as an
+`OrderedDict`, list it in `dicts`, and list the module that defines it in `modules`:
+
+```julia
+from_json(js; modules = (MyPkg, OrderedCollections), dicts = (OrderedDict,))
+```
+
+The decode calls `setindex!` on the new dict with the keys and values of the document, and
+another dict type can act on the system. List only dict types whose `setindex!` only
+stores data. The type of `ENV`, for example, does not decode even when `Base` is listed.
 
 ### Skipping live, non-data fields with `opaque`
 
