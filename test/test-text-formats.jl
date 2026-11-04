@@ -128,19 +128,26 @@ end
 
 @testset "core loads no backend; formats name the missing package" begin
     # Run in a fresh process with only the core loaded: no format package is pulled in,
-    # and a format function fails with a message that says which package to load.
+    # and a format function fails with a message that says which package to load. The
+    # system image of Julia 1.10 holds the TOML stdlib, so TOML is loaded before the core
+    # there, and its extension loads with the core: that format must then work.
     project = dirname(Base.active_project())
     code = """
+    before = Set(string(m) for m in values(Base.loaded_modules))
     using TypeAgnosticSerialisation
     loaded = Set(string(m) for m in values(Base.loaded_modules))
-    @assert !any(in(loaded), ("JSON", "YAML", "MsgPack"))
+    @assert !any(in(setdiff(loaded, before)), ("JSON", "YAML", "TOML", "MsgPack"))
     for (f, pkg) in ((to_json, "JSON"), (to_yaml, "YAML"), (to_toml, "TOML"), (to_msgpack, "MsgPack"))
         msg = try
             f(1); ""
         catch e
             sprint(showerror, e)
         end
-        @assert occursin("import \$pkg", msg) msg
+        if pkg in before
+            @assert isempty(msg) msg
+        else
+            @assert occursin("import \$pkg", msg) msg
+        end
     end
     print("ok")
     """
