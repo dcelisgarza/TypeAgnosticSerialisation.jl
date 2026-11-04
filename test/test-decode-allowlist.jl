@@ -62,6 +62,55 @@ end
     end
 end
 
+@testset "a dict type in `dicts` decodes (validate=$v)" for v in (false, true)
+    M.DICT_WRITES[] = 0
+    payload = encode(Dict("a" => 1, "b" => 2), Dict{String,Int}, SerdeContext())
+    tree = tagged(CountingDict{String,Int}, payload)
+    load = v ? from_json : from_json_direct
+    for d in (
+        decode(tree, SerdeContext((M,); dicts = (CountingDict,), validate = v)),
+        load(JSON.json(tree); modules = (M,), dicts = (CountingDict,)),
+        # A parameterised type names the same wrapper, so it admits each parameter.
+        decode(tree, SerdeContext((M,); dicts = (CountingDict{Int,Int},), validate = v)),
+    )
+        @test d isa CountingDict{String,Int}
+        @test d.d == Dict("a" => 1, "b" => 2)
+    end
+    @test M.DICT_WRITES[] == 6
+    # `dicts` does not open the module gate: the type must be in a listed module.
+    @test_throws "module $(M) is not in the allowlist" decode(
+        tree,
+        SerdeContext(; dicts = (CountingDict,), validate = v),
+    )
+    # Nor the gate of Base: a dict type of Base needs Base in `modules` too.
+    tree = tagged(WeakKeyDict{Any,Any}, Dict{String,Any}("pairs" => Any[]))
+    @test_throws "not a plain data type of Base" decode(
+        tree,
+        SerdeContext(; dicts = (WeakKeyDict,), validate = v),
+    )
+    ctx = SerdeContext((Base,); dicts = (WeakKeyDict,), validate = v)
+    @test decode(tree, ctx) isa WeakKeyDict{Any,Any}
+end
+
+@testset "dicts must hold dict types" begin
+    @test_throws "not a subtype of `AbstractDict`" SerdeContext(; dicts = (Int,))
+    @test_throws "not a subtype of `AbstractDict`" SerdeContext(; dicts = (1,))
+end
+
+@testset "the positional constructor of v0.3.0 still works" begin
+    c = SerdeContext((M,); functions = (sin,))
+    c2 = SerdeContext(
+        c.modules,
+        c.plain_only,
+        c.opaque,
+        c.functions,
+        c.function_types,
+        c.validate,
+    )
+    @test Set(c2.dicts) == Set(Any[Dict, IdDict])
+    @test decode(encode(Holder(sin), c), c2).f === sin
+end
+
 @testset "Base and Core give only their plain data types (validate=$v)" for v in
                                                                             (false, true)
     tree = tagged(Base.RefValue{Int}, Dict{String,Any}("x" => 1))
