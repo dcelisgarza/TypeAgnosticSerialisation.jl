@@ -175,12 +175,14 @@ end
 @testset "named function as a value (validate=$v)" for v in (false, true)
     # The type of a named function is a singleton with no constructor. The validated
     # decode gives back its one instance, the function itself.
+    fs = (bump, sin)
     for x in Any[bump, Smoother(bump, 0.5), Any[bump, sin]]
-        r = roundtrip(x; modules = (M,), validate = v)
+        r = roundtrip(x; modules = (M,), functions = fs, validate = v)
         @test r.ok_tree
         @test r.ok_text
     end
-    @test roundtrip(Smoother(bump, 0.5); modules = (M,), validate = v).text.kernel === bump
+    r = roundtrip(Smoother(bump, 0.5); modules = (M,), functions = fs, validate = v)
+    @test r.text.kernel === bump
 end
 
 @testset "keyword-fallback constructor (KwOnly)" begin
@@ -280,8 +282,12 @@ end
     @test SerdeContext(M) isa SerdeContext
     @test SerdeContext((M,)) isa SerdeContext
     @test SerdeContext(; modules = (M,)) isa SerdeContext
-    # Base and Core are always present.
+    # Base and Core are always present, but only for their plain data types.
     ctx = SerdeContext()
     @test ctx.modules["Base"] === Base
     @test ctx.modules["Core"] === Core
+    @test Set(ctx.plain_only) == Set([Base, Core])
+    @test isempty(ctx.functions)
+    # Listing Base trusts all of it; Core stays plain only.
+    @test SerdeContext((Base,)).plain_only == [Core]
 end

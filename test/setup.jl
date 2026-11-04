@@ -17,7 +17,7 @@ import JSON, MsgPack, TOML, YAML
 module TestSerdeModule
 
 export AbstractShape, Circle, Rect, Square, Color, red, green, blue
-export Scene, Doc, KwOnly, Handle, NoDefault, Loose, Smoother, bump
+export Scene, Doc, KwOnly, Handle, NoDefault, Loose, Smoother, bump, Holder, CountingDict
 
 abstract type AbstractShape end
 
@@ -90,6 +90,25 @@ struct Smoother{F}
     width::Float64
 end
 
+# The reproduction of issue #10: a struct that holds a function of Base.
+struct Holder{F}
+    f::F
+end
+
+# A dict type that counts each `setindex!` on it. The decode must refuse it before it
+# builds one, so the count stays zero.
+const DICT_WRITES = Ref(0)
+struct CountingDict{K,V} <: AbstractDict{K,V}
+    d::Dict{K,V}
+    CountingDict{K,V}() where {K,V} = new{K,V}(Dict{K,V}())
+end
+function Base.setindex!(c::CountingDict, v, k)
+    DICT_WRITES[] += 1
+    return setindex!(c.d, v, k)
+end
+Base.iterate(c::CountingDict, s...) = iterate(c.d, s...)
+Base.length(c::CountingDict) = length(c.d)
+
 end # module TestSerdeModule
 
 using .TestSerdeModule
@@ -138,13 +157,12 @@ end
 
 # Round-trip `x` through BOTH the tree layer (encode/decode) and the text layer
 # (to_json/from_json*), returning the reconstructed values and whether they match.
-function roundtrip(x; modules = (), opaque = (), validate = false)
-    ctx = SerdeContext(modules; opaque = opaque, validate = validate)
+function roundtrip(x; modules = (), opaque = (), functions = (), validate = false)
+    ctx = SerdeContext(modules; opaque = opaque, functions = functions, validate = validate)
     x_tree = decode(encode(x, ctx), ctx)
     js = to_json(x; modules = modules, opaque = opaque)
-    x_text =
-        validate ? from_json(js; modules = modules, opaque = opaque) :
-        from_json_direct(js; modules = modules, opaque = opaque)
+    kw = (; modules = modules, opaque = opaque, functions = functions)
+    x_text = validate ? from_json(js; kw...) : from_json_direct(js; kw...)
     return (;
         tree = x_tree,
         text = x_text,

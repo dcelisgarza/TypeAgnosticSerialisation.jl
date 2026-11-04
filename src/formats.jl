@@ -32,13 +32,23 @@ end
 _render(::Val{F}, tree; kwargs...) where {F} = _missing_backend(F)
 _parse(::Val{F}, data) where {F} = _missing_backend(F)
 
-function _serialise(fmt::Val, x; modules = (), opaque = (), kwargs...)
+# `functions` gates the decode only. The encoder accepts it too, so that one set of keyword
+# arguments can serve both directions.
+function _serialise(fmt::Val, x; modules = (), opaque = (), functions = (), kwargs...)
     return _render(fmt, encode(x, SerdeContext(modules; opaque = opaque)); kwargs...)
 end
 
-function _deserialise(fmt::Val, data, validate::Bool; modules = (), opaque = ())
+function _deserialise(
+    fmt::Val,
+    data,
+    validate::Bool;
+    modules = (),
+    opaque = (),
+    functions = (),
+)
     tree = _parse(fmt, data)
-    return decode(tree, SerdeContext(modules; opaque = opaque, validate = validate))
+    ctx = SerdeContext(modules; opaque = opaque, functions = functions, validate = validate)
+    return decode(tree, ctx)
 end
 
 # ---------------------------------------------------------------------------
@@ -65,7 +75,7 @@ Read back with [`from_json`](@ref) (validated) or [`from_json_direct`](@ref).
 to_json(x; kwargs...) = _serialise(Val(:json), x; kwargs...)
 
 """
-    from_json(str; modules = (), opaque = ()) -> value
+    from_json(str; modules = (), opaque = (), functions = ()) -> value
 
 Read a JSON string produced by [`to_json`](@ref) back into a Julia value, **validated**:
 every struct is rebuilt through its own constructor, so all inner-constructor /
@@ -75,8 +85,14 @@ recommended, default loader.
 It requires a constructor that can be replayed from the fields — positional in declaration
 order, or keyword by field name. A type whose constructor cannot be replayed fails loudly;
 mark it `opaque` or use [`from_json_direct`](@ref) for those. `modules` is the resolution
-allowlist (a bare `Module` is accepted); only types reachable from it — plus the
-always-present `Base`/`Core` — can be named.
+allowlist (a bare `Module` is accepted); only types defined in it — plus the plain data
+types and containers of `Base`/`Core` — can be named. `functions` lists the named
+functions that may decode; the default is empty, so no function decodes. See
+[`SerdeContext`](@ref) for the exact rules.
+
+The validation runs the constructors of the listed types on the values that the document
+gives. It checks the invariants of your own data; it does **not** make a document from an
+untrusted source safe to load. Load only documents that you wrote yourself.
 
 Needs the JSON package: load it with `import JSON` first. See also
 [`from_json_direct`](@ref) for the non-validating counterpart.
@@ -84,7 +100,7 @@ Needs the JSON package: load it with `import JSON` first. See also
 from_json(str::AbstractString; kwargs...) = _deserialise(Val(:json), str, true; kwargs...)
 
 """
-    from_json_direct(str; modules = (), opaque = ()) -> value
+    from_json_direct(str; modules = (), opaque = (), functions = ()) -> value
 
 Read a JSON string produced by [`to_json`](@ref) back into a Julia value, **directly**:
 each struct is built field-by-field with Julia's own `new` (via `Expr(:new)`), bypassing
@@ -95,7 +111,7 @@ validation.
 
 Use it for JSON you produced and trust, or for types whose constructor cannot be replayed
 from its fields. When you want invariants enforced on load, use [`from_json`](@ref)
-instead. `modules`/`opaque` behave exactly as for [`from_json`](@ref).
+instead. `modules`/`opaque`/`functions` behave exactly as for [`from_json`](@ref).
 """
 function from_json_direct(str::AbstractString; kwargs...)
     return _deserialise(Val(:json), str, false; kwargs...)
@@ -119,7 +135,7 @@ behave as for [`to_json`](@ref).
 to_yaml(x; kwargs...) = _serialise(Val(:yaml), x; kwargs...)
 
 """
-    from_yaml(str; modules = (), opaque = ()) -> value
+    from_yaml(str; modules = (), opaque = (), functions = ()) -> value
 
 Read a YAML string produced by [`to_yaml`](@ref) back into a Julia value, **validated**
 (every struct is rebuilt through its own constructor) — the YAML counterpart of
@@ -132,7 +148,7 @@ package: load it with `import YAML` first.
 from_yaml(str::AbstractString; kwargs...) = _deserialise(Val(:yaml), str, true; kwargs...)
 
 """
-    from_yaml_direct(str; modules = (), opaque = ()) -> value
+    from_yaml_direct(str; modules = (), opaque = (), functions = ()) -> value
 
 Read a YAML string produced by [`to_yaml`](@ref) back into a Julia value, **directly**
 (each struct is built with Julia's own `new`, no user validation) — the YAML counterpart of
@@ -160,7 +176,7 @@ behave as for [`to_json`](@ref).
 to_toml(x; kwargs...) = _serialise(Val(:toml), x; kwargs...)
 
 """
-    from_toml(str; modules = (), opaque = ()) -> value
+    from_toml(str; modules = (), opaque = (), functions = ()) -> value
 
 Read a TOML string produced by [`to_toml`](@ref) back into a Julia value, **validated**
 (every struct is rebuilt through its own constructor) — the TOML counterpart of
@@ -169,7 +185,7 @@ Read a TOML string produced by [`to_toml`](@ref) back into a Julia value, **vali
 from_toml(str::AbstractString; kwargs...) = _deserialise(Val(:toml), str, true; kwargs...)
 
 """
-    from_toml_direct(str; modules = (), opaque = ()) -> value
+    from_toml_direct(str; modules = (), opaque = (), functions = ()) -> value
 
 Read a TOML string produced by [`to_toml`](@ref) back into a Julia value, **directly**
 (each struct is built with Julia's own `new`, no user validation) — the TOML counterpart of
@@ -198,7 +214,7 @@ behave as for [`to_json`](@ref).
 to_msgpack(x; kwargs...) = _serialise(Val(:msgpack), x; kwargs...)
 
 """
-    from_msgpack(bytes; modules = (), opaque = ()) -> value
+    from_msgpack(bytes; modules = (), opaque = (), functions = ()) -> value
 
 Read MessagePack bytes produced by [`to_msgpack`](@ref) back into a Julia value,
 **validated** (every struct is rebuilt through its own constructor) — the MessagePack
@@ -210,7 +226,7 @@ function from_msgpack(bytes::AbstractVector{UInt8}; kwargs...)
 end
 
 """
-    from_msgpack_direct(bytes; modules = (), opaque = ()) -> value
+    from_msgpack_direct(bytes; modules = (), opaque = (), functions = ()) -> value
 
 Read MessagePack bytes produced by [`to_msgpack`](@ref) back into a Julia value,
 **directly** (each struct is built with Julia's own `new`, no user validation) — the

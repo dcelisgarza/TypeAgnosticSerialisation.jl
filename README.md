@@ -19,8 +19,15 @@ Each format is a package extension that activates when you load its backend pack
 *Formats* below).
 
 Type resolution is gated by a **module allowlist**: a `__type__` tag may only name a type
-reachable from a module you explicitly trust. There is no `eval` of strings from the
+defined in a module you explicitly trust, or a plain data type of `Base`/`Core`. A named
+function decodes only if you list it in `functions`. There is no `eval` of strings from the
 document.
+
+**Load only documents that you wrote yourself.** The allowlists limit what a document can
+name. They do not make a document from an untrusted source safe to load: the decode builds
+the types that you allow with the field values that the document gives. Versions before
+0.3.0 trusted all of `Base` and `Core` and decoded any named function; do not use them for
+documents that you did not write.
 
 ## Installation
 
@@ -104,10 +111,11 @@ julia> back.bg === green
 true
 ```
 
-The `modules` allowlist is what makes reconstruction safe: only types reachable from the
-modules you pass (plus the always-present `Base`/`Core`) can be named by a tag. Hand the
-same document to a context that does not allow `Shapes`, and resolution is refused rather
-than resolving an unexpected type:
+The `modules` allowlist limits the types that a tag can name: only types defined in the
+modules you pass, plus the plain data types and containers of `Base`/`Core` (numbers,
+strings, symbols, arrays, tuples, named tuples, `Dict`, ranges, …). Hand the same document
+to a context that does not allow `Shapes`, and resolution is refused rather than resolving
+an unexpected type:
 
 ```julia
 julia> try
@@ -164,6 +172,29 @@ constructor cannot be replayed from its fields:
 julia> from_json_direct(bad; modules = (Shapes,)).shapes[1].r
 -1.5
 ```
+
+### Named functions with `functions`
+
+A field can hold a named function, such as a kernel or a link function. Its type alone
+states the value, so the document holds no data for it. A named function decodes only if
+you list it in `functions`; the default list is empty, so no function decodes:
+
+```julia
+julia> js = to_json((; kernel = sin));
+
+julia> try
+           from_json(js)
+       catch
+           :refused
+       end
+:refused
+
+julia> from_json(js; functions = (sin,)).kernel === sin
+true
+```
+
+A dict decodes only into `Dict` or `IdDict`: the decode calls `setindex!` on the new dict,
+and another dict type can act on the system.
 
 ### Skipping live, non-data fields with `opaque`
 
