@@ -30,10 +30,12 @@
 #     `encode`/`decode` core is text-agnostic — swap the JSON layer freely.
 #
 #   * Type resolution is gated by a **module allowlist**. A `__type__` tag can only
-#     name a type reachable from an allowed module; anything else errors. There is no
-#     `eval` of strings from the JSON. `Base` and `Core` are always allowed (they hold
-#     the primitives — `Float64`, `Symbol`, `Array`, `Dict`, ...); the caller adds the
-#     modules that define their own types, e.g. `PortfolioOptimisers`, `StatsBase`.
+#     name a type defined in an allowed module; anything else errors. There is no
+#     `eval` of strings from the JSON. Of `Base` and `Core`, only the plain data types
+#     and containers resolve (`Float64`, `Symbol`, `Array`, `Dict`, ...) unless the
+#     caller lists the module; the caller adds the modules that define their own types,
+#     e.g. `PortfolioOptimisers`, `StatsBase`. A named function decodes only if the
+#     caller lists it in `functions`, and a dict decodes only into `Dict` or `IdDict`.
 #
 # Layering:
 #   encode(x, ctx)              :: value  -> plain tree (Dict/Vector/scalars) [no deps]
@@ -64,18 +66,25 @@ export to_msgpack, from_msgpack, from_msgpack_direct
 # ---------------------------------------------------------------------------
 
 """
-    SerdeContext(modules; opaque = (), validate = false)
-    SerdeContext(single_module::Module; opaque = (), validate = false)
-    SerdeContext(; modules = (), opaque = (), validate = false)
+    SerdeContext(modules; opaque = (), functions = (), validate = false)
+    SerdeContext(single_module::Module; opaque = (), functions = (), validate = false)
+    SerdeContext(; modules = (), opaque = (), functions = (), validate = false)
 
-The state threaded through every [`encode`](@ref)/[`decode`](@ref) call. It holds three
+The state threaded through every [`encode`](@ref)/[`decode`](@ref) call. It holds four
 things:
 
   - `modules`: the **allowlist** used to resolve `__type__` tags back to concrete types. A
-    tag may only name a type reachable from one of these modules; anything else errors.
-    `Base` and `Core` are always added automatically (they hold the primitives —
-    `Float64`, `Symbol`, `Array`, `Dict`, …), so you only pass the modules that define
-    *your own* types. A single `Module` is accepted directly, or any iterable of modules.
+    tag may only name a type *defined* in one of these modules (or in a submodule of
+    one); anything else errors. A single `Module` is accepted directly, or any iterable
+    of modules. `Base` and `Core` are **not** trusted as a whole: unless listed, only
+    their plain data types and containers resolve — the numbers, `String`, `Symbol`,
+    `Char`, `Nothing`, `Missing`, `Array`, `Tuple`, `NamedTuple`, `Pair`, `Dict`,
+    `IdDict`, the ranges, `Some`, `Val`, the type objects, and every abstract type.
+    Listing `Base` or `Core` in `modules` trusts all of that module.
+  - `functions`: the named functions that may decode. A value whose type is a singleton
+    subtype of `Function` — a named function such as `sin`, or an anonymous function with
+    no captures — decodes only if it is in this list, in both decode modes and from any
+    module, listed or not. The default is empty: no function decodes.
   - `opaque`: a collection of types that are **not** serialised structurally. A value
     whose type is (a subtype of) one of these is replaced by a placeholder on encode and
     rebuilt with its no-argument constructor `T()` on decode. Use it for live, non-data
@@ -85,29 +94,179 @@ things:
     constructor (running all validation); `false` builds directly with Julia's `new`
     (no validation). See [`from_json`](@ref) and [`from_json_direct`](@ref).
 
+A dict decodes only into `Dict` or `IdDict`, even when `Base` is listed: the decode calls
+`T()` and `setindex!`, and another dict type (such as the type of `ENV`) can act on the
+system.
+
 You rarely build one by hand — [`to_json`](@ref), [`from_json`](@ref) and
 [`from_json_direct`](@ref) construct it for you from the same keyword arguments.
+
+!!! warning
+
+    The allowlists limit what a document can name. They do not make a document from an
+    untrusted source safe to load: a listed type or function can still act on the field
+    values that the document gives it. Load only documents that you wrote yourself.
 """
 struct SerdeContext
-    modules::Dict{String,Module}   # string(module) => Module
+    modules::Dict{String,Module}   # string(module) => Module; Base and Core always present
+    plain_only::Vector{Module}     # Base/Core when the caller did not list them
     opaque::Vector{Any}            # types serialised as a placeholder, rebuilt via T()
+    functions::Vector{Any}         # the singleton functions that may decode
+    function_types::Dict{Tuple{String,String},DataType}  # (module, name) => typeof(f)
     validate::Bool                 # decode: true = via constructor; false = direct `new`
 end
 
-function SerdeContext(mods; opaque = (), validate::Bool = false)
+function SerdeContext(mods; opaque = (), functions = (), validate::Bool = false)
+    listed = collect(Module, mods)
     d = Dict{String,Module}()
-    for m in (Base, Core, mods...)
+    for m in (Base, Core, listed...)
         d[string(m)] = m
     end
-    return SerdeContext(d, collect(Any, opaque), validate)
+    plain_only = Module[m for m in (Base, Core) if !any(x -> x === m, listed)]
+    fs = collect(Any, functions)
+    ftypes = Dict{Tuple{String,String},DataType}()
+    for f in fs
+        F = typeof(f)
+        if !(_is_function_type(F))
+            error(
+                "TypeAgnosticSerialisation: `functions` holds $(repr(f))::$(F), which is " *
+                "not a named function (a singleton subtype of `Function`).",
+            )
+        end
+        ftypes[(string(parentmodule(F)), string(nameof(F)))] = F
+    end
+    return SerdeContext(d, plain_only, collect(Any, opaque), fs, ftypes, validate)
 end
 # A single module is the common case; accept it without asking the caller to wrap it in a
 # one-tuple (`modules = MyPkg` rather than `modules = (MyPkg,)`).
-function SerdeContext(m::Module; opaque = (), validate::Bool = false)
-    return SerdeContext((m,); opaque = opaque, validate = validate)
+function SerdeContext(m::Module; opaque = (), functions = (), validate::Bool = false)
+    return SerdeContext((m,); opaque = opaque, functions = functions, validate = validate)
 end
-function SerdeContext(; modules = (), opaque = (), validate::Bool = false)
-    return SerdeContext(modules; opaque = opaque, validate = validate)
+function SerdeContext(; modules = (), opaque = (), functions = (), validate::Bool = false)
+    return SerdeContext(
+        modules;
+        opaque = opaque,
+        functions = functions,
+        validate = validate,
+    )
+end
+
+# ---------------------------------------------------------------------------
+# Decode gates. A document names the types that it holds, so each name that it uses
+# must pass these checks before a value of that type is built.
+# ---------------------------------------------------------------------------
+
+# The type of a named function (`typeof(sin)`), or of an anonymous function with no
+# captures: a singleton whose one value is the function.
+function _is_function_type(@nospecialize(T))
+    return T isa DataType && T <: Function && Base.issingletontype(T)
+end
+
+function _check_function(@nospecialize(F::DataType), ctx::SerdeContext)
+    f = F.instance
+    if !any(g -> g === f, ctx.functions)
+        error(
+            "TypeAgnosticSerialisation: the function $(parentmodule(F)).$(nameof(f)) is " *
+            "not in the `functions` allowlist. Pass it via `functions = (…, $(nameof(f)), …)`.",
+        )
+    end
+    return f
+end
+
+# The plain data types and containers of Base and Core: a value of one holds data only.
+# Matched by the unparameterised wrapper.
+const _PLAIN_TYPES = Base.IdSet{Any}(
+    Any[
+        Any,
+        Nothing,
+        Missing,
+        Bool,
+        Int8,
+        Int16,
+        Int32,
+        Int64,
+        Int128,
+        UInt8,
+        UInt16,
+        UInt32,
+        UInt64,
+        UInt128,
+        Float16,
+        Float32,
+        Float64,
+        BigInt,
+        BigFloat,
+        Rational,
+        Complex,
+        Irrational,
+        Char,
+        String,
+        Symbol,
+        Array,
+        Tuple,
+        NamedTuple,
+        Pair,
+        Dict,
+        IdDict,
+        Some,
+        Val,
+        UnitRange,
+        StepRange,
+        StepRangeLen,
+        LinRange,
+        Base.OneTo,
+        Base.TwicePrecision,
+        DataType,
+        UnionAll,
+        Union,
+        Core.TypeofBottom,
+    ],
+)
+
+# The dict types that may decode. The decode calls `T()` and `setindex!` on the dict.
+const _PLAIN_DICTS = Base.IdSet{Any}(Any[Dict, IdDict])
+
+function _wrapper(@nospecialize(T))
+    U = Base.unwrap_unionall(T)
+    return U isa DataType ? U.name.wrapper : T
+end
+
+# An abstract type has no values of its own, so it is safe as a type parameter.
+function _is_abstract(@nospecialize(T))
+    U = Base.unwrap_unionall(T)
+    return U isa DataType && isabstracttype(U)
+end
+
+_is_plain(@nospecialize(T)) = _wrapper(T) in _PLAIN_TYPES || _is_abstract(T)
+
+# The type must be *defined* in an allowlisted module (or a submodule of one), not only be
+# reachable by name through one: `using Base: Cmd` in a listed module must not make `Cmd`
+# resolve. A type of Base or Core must be plain unless the caller listed that module. The
+# walk stops at Base and Core, because `parentmodule(Base) === Main`.
+function _check_type(@nospecialize(T), ctx::SerdeContext)
+    owner = parentmodule(T)
+    m = owner
+    while true
+        if m === Base || m === Core
+            if any(x -> x === m, ctx.plain_only) && !_is_plain(T)
+                error(
+                    "TypeAgnosticSerialisation: $(owner).$(nameof(T)) is not a plain data " *
+                    "type of $(m), so it resolves only if $(m) is in `modules`.",
+                )
+            end
+            return T
+        elseif any(x -> x === m, values(ctx.modules))
+            return T
+        end
+        p = parentmodule(m)
+        if p === m
+            error(
+                "TypeAgnosticSerialisation: $(nameof(T)) is defined in module $(owner), " *
+                "which is not in the allowlist.",
+            )
+        end
+        m = p
+    end
 end
 
 # A type marked opaque (or a subtype of one) is not serialised structurally; it is
@@ -295,6 +454,12 @@ function _resolve_type(desc, ctx::SerdeContext, env::Vector{TypeVar} = TypeVar[]
     if desc["name"] == "Bottom"
         return Union{}
     end
+    # A listed function resolves by its own module and name, also when the module of the
+    # function is not in `modules`.
+    F = get(ctx.function_types, (string(desc["module"]), string(desc["name"])), nothing)
+    if F !== nothing && isempty(desc["params"])
+        return F
+    end
     mod = _lookup_module(desc["module"], ctx)
     sym = Symbol(desc["name"])
     if !(isdefined(mod, sym))
@@ -306,6 +471,10 @@ function _resolve_type(desc, ctx::SerdeContext, env::Vector{TypeVar} = TypeVar[]
     if !(base isa Type)
         error("TypeAgnosticSerialisation: $(desc["module"]).$(desc["name"]) is not a type.")
     end
+    if _is_function_type(base)
+        _check_function(base, ctx)   # a listed function returned above, so this refuses
+    end
+    _check_type(base, ctx)
     params = Any[_resolve_param(p, ctx, env) for p in desc["params"]]
     if !isempty(params)
         return Core.apply_type(base, params...)
@@ -354,9 +523,6 @@ function _newbuild(@nospecialize(T::DataType), fields::Vector{Any})
 end
 
 function _construct_safe(@nospecialize(T::DataType), fields::Vector{Any})
-    # The type of a named function, such as `typeof(sin)`, is a singleton with no
-    # constructor. Its one value is the function, so there is no validation to replay.
-    T <: Function && Base.issingletontype(T) && return T.instance
     x = _construct_via_wrapper(T, fields)
     if typeof(x) === T
         return x
@@ -585,6 +751,10 @@ end
 function _decode_plain(payload, @nospecialize(T), ctx::SerdeContext)
     if _is_opaque(T, ctx)
         return _construct_opaque(T)
+    elseif _is_function_type(T)
+        # A named function: the type alone states the value, in both modes. It comes back
+        # only if the caller listed it.
+        return _check_function(T, ctx)
     elseif T <: Type
         # The value itself is a type; payload is a type reference.
         return _resolve_type(payload, ctx)
@@ -613,6 +783,12 @@ function _decode_plain(payload, @nospecialize(T), ctx::SerdeContext)
         flat = isempty(data) ? Array{el}(undef, 0) : convert(Vector{el}, data)
         return convert(T, reshape(flat, sz))
     elseif T <: AbstractDict
+        if !(_wrapper(T) in _PLAIN_DICTS)
+            error(
+                "TypeAgnosticSerialisation: the dict type $(T) is not in the allowlist; " *
+                "a dict decodes only into `Dict` or `IdDict`.",
+            )
+        end
         K, V = keytype(T), valtype(T)
         d = T()
         for kv in payload["pairs"]
