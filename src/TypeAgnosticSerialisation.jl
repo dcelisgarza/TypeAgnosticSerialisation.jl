@@ -51,8 +51,9 @@
 # Reserved tree keys: "__type__", "__value__" (tagged envelope); "type"/"value"
 # (type-parameter wrappers); "union", "where"/"body", "typevar", "vararg"/"count"
 # (non-DataType type descriptors); "size"/"data" (arrays); "pairs" (dicts);
-# "names"/"values" (named tuples). A struct field literally named "__type__" would
-# collide — documented limitation.
+# "names"/"values" (named tuples); "__meta__" (the version record beside the top-level
+# envelope, see `encode`). A struct field literally named "__type__" would collide —
+# documented limitation.
 
 module TypeAgnosticSerialisation
 
@@ -121,6 +122,33 @@ struct SerdeContext
     function_types::Dict{Tuple{String,String},DataType}  # (module, name) => typeof(f)
     dicts::Base.IdSet{Any}         # wrappers of the dict types that may decode
     validate::Bool                 # decode: true = via constructor; false = direct `new`
+    # encode: the root modules of the types that the encoder described, keyed by name, for
+    # the `"__meta__"` record. Only the private copy that the top-level `encode(v, ctx)`
+    # makes holds a dict; a context that the caller builds holds `nothing`, so that a
+    # context that many tasks share never changes.
+    seen::Union{Nothing,Dict{String,Module}}
+end
+
+# The positional form of v0.3.1, which had no `seen` field.
+function SerdeContext(
+    modules,
+    plain_only,
+    opaque,
+    functions,
+    function_types,
+    dicts::Base.IdSet{Any},
+    validate,
+)
+    return SerdeContext(
+        modules,
+        plain_only,
+        opaque,
+        functions,
+        function_types,
+        dicts,
+        validate,
+        nothing,
+    )
 end
 
 # The positional form of v0.3.0, which had no `dicts` field.
@@ -357,6 +385,16 @@ function _is_bare_wrapper(@nospecialize(T::UnionAll))
     return isdefined(m, n) && getfield(m, n) === T
 end
 
+# Record the root module of a type that the encoder describes, for the `"__meta__"` record.
+function _record!(ctx::SerdeContext, m::Module)
+    seen = ctx.seen
+    if seen !== nothing
+        r = Base.moduleroot(m)
+        seen[string(r)] = r
+    end
+    return nothing
+end
+
 function _type_desc(@nospecialize(T), ctx::SerdeContext, env::Vector{TypeVar} = TypeVar[])
     if T === Union{}
         return Dict{String,Any}("name" => "Bottom", "module" => "Core", "params" => Any[])
@@ -385,6 +423,7 @@ function _type_desc(@nospecialize(T), ctx::SerdeContext, env::Vector{TypeVar} = 
     elseif T isa UnionAll
         if _is_bare_wrapper(T)
             # Compact, readable form; resolves back through the allowlist by name.
+            _record!(ctx, parentmodule(T))
             return Dict{String,Any}(
                 "name" => string(nameof(T)),
                 "module" => string(parentmodule(T)),
@@ -405,6 +444,7 @@ function _type_desc(@nospecialize(T), ctx::SerdeContext, env::Vector{TypeVar} = 
             pop!(env)
         end
     elseif T isa DataType
+        _record!(ctx, parentmodule(T))
         return Dict{String,Any}(
             "name" => string(nameof(T)),
             "module" => string(parentmodule(T)),
@@ -628,6 +668,13 @@ bare structural payload is emitted; otherwise the value is wrapped in a self-des
 `{"__type__": …, "__value__": …}` envelope carrying the full concrete type (including type
 parameters). The two-argument form uses `hint = Any`, so the top level is always tagged.
 
+The two-argument form also adds a `"__meta__"` key beside `"__type__"` and `"__value__"`.
+It records the Julia version (`"julia"`) and, in `"packages"`, the UUID and the version of
+each package that defines a type of the document, and of TypeAgnosticSerialisation itself.
+A module that is not a package, such as `Main`, has no entry. [`decode`](@ref) reads the
+record to warn when a package has a breaking version change after the encode. The
+three-argument form writes no record.
+
 Invert with [`decode`](@ref).
 
 ```jldoctest
@@ -639,7 +686,37 @@ julia> decode(tree, ctx)
 (1, "two", :three)
 ```
 """
-encode(v, ctx::SerdeContext) = encode(v, Any, ctx)
+function encode(v, ctx::SerdeContext)
+    # A private copy with a fresh recorder: the caller's context never changes.
+    rec = SerdeContext(
+        ctx.modules,
+        ctx.plain_only,
+        ctx.opaque,
+        ctx.functions,
+        ctx.function_types,
+        ctx.dicts,
+        ctx.validate,
+        Dict{String,Module}(),
+    )
+    tree = encode(v, Any, rec)
+    tree["__meta__"] = _meta(rec.seen)
+    return tree
+end
+
+# The `"__meta__"` record: the Julia version, and the UUID and version of each package
+# whose types the document names. Base and Core have no UUID; `"julia"` covers them.
+function _meta(seen::Dict{String,Module})
+    pkgs = Dict{String,Any}()
+    for m in (values(seen)..., @__MODULE__)
+        id = Base.PkgId(m)
+        id.uuid === nothing && continue
+        entry = Dict{String,Any}("uuid" => string(id.uuid))
+        v = pkgversion(m)
+        v === nothing || (entry["version"] = string(v))
+        pkgs[id.name] = entry
+    end
+    return Dict{String,Any}("julia" => string(VERSION), "packages" => pkgs)
+end
 
 function encode(@nospecialize(v), @nospecialize(H), ctx::SerdeContext)
     T = typeof(v)
@@ -752,6 +829,12 @@ allowlist; there is no `eval` of strings from the tree. `ctx.validate` selects h
 are rebuilt — through their constructor (validated) or via `new` (direct). See
 [`SerdeContext`](@ref).
 
+The two-argument form reads the `"__meta__"` record that [`encode`](@ref) writes. If a
+package of the record is loaded at a version that is not semver compatible with the
+recorded one, or at an older version, it logs a warning and then decodes. A breaking
+change can make the decode fail or give a different value. A tree with no record, from a
+version before v0.4.0, decodes with no check.
+
 ```jldoctest
 julia> ctx = SerdeContext();
 
@@ -762,7 +845,56 @@ julia> decode(encode([1.0, 2.0, 3.0], ctx), ctx)
  3.0
 ```
 """
-decode(tree, ctx::SerdeContext) = decode(tree, Any, ctx)
+function decode(tree, ctx::SerdeContext)
+    if tree isa AbstractDict && haskey(tree, "__meta__")
+        _check_versions(tree["__meta__"])
+    end
+    return decode(tree, Any, ctx)
+end
+
+# The part of a version that a breaking change increments, by semver as Pkg reads it.
+function _breaking_part(v::VersionNumber)
+    v.major != 0 && return (v.major,)
+    v.minor != 0 && return (0, v.minor)
+    return (0, 0, v.patch)
+end
+
+# Parse a string of the record; any other value, such as a number, is malformed.
+_tryparse_string(::Type{T}, s::AbstractString) where {T} = tryparse(T, s)
+_tryparse_string(::Type, _) = nothing
+
+# Warn for each package of the record that is loaded at an incompatible or older version.
+# The record is data from the document: a malformed entry is skipped, never an error.
+function _check_versions(meta)
+    meta isa AbstractDict || return nothing
+    pkgs = get(meta, "packages", nothing)
+    pkgs isa AbstractDict || return nothing
+    for (name, entry) in pkgs
+        (name isa AbstractString && entry isa AbstractDict) || continue
+        uuid = _tryparse_string(Base.UUID, get(entry, "uuid", nothing))
+        old = _tryparse_string(VersionNumber, get(entry, "version", nothing))
+        (uuid === nothing || old === nothing) && continue
+        m = get(Base.loaded_modules, Base.PkgId(uuid, String(name)), nothing)
+        m === nothing && continue
+        new = pkgversion(m)
+        new === nothing && continue
+        if _breaking_part(old) != _breaking_part(new)
+            why = "a breaking version change"
+        elseif new < old
+            why = "an older version"
+        else
+            continue
+        end
+        @warn(
+            "TypeAgnosticSerialisation: the document was written with $(name) v$(old), " *
+            "and $(name) v$(new) is loaded, $(why). The decode can fail or give a " *
+            "different value.",
+            maxlog = 1,
+            _id = Symbol(name, "@", old, "->", new),
+        )
+    end
+    return nothing
+end
 
 function decode(tree, @nospecialize(H), ctx::SerdeContext)
     if tree isa AbstractDict && haskey(tree, "__type__")

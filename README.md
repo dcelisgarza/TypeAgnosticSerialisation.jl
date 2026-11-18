@@ -140,9 +140,29 @@ envelope carrying its full concrete type. For a single `Circle(1.5)` the JSON re
   },
   "__value__": {
     "r": 1.5
+  },
+  "__meta__": {
+    "julia": "1.12.1",
+    "packages": {
+      "TypeAgnosticSerialisation": {
+        "uuid": "711d1e8a-e0c5-5f25-919c-2a5a262959e5",
+        "version": "0.4.0"
+      }
+    }
   }
 }
 ```
+
+### The version record
+
+From v0.4.0, the top level of a document has a `"__meta__"` key beside the envelope. It
+records the Julia version that wrote the document, and the UUID and version of each package
+that defines a type of the document, and of TypeAgnosticSerialisation itself. A module that
+is not a package, such as `Main.Shapes` above, has no entry. When a document is read, each
+recorded package that is loaded at a version that is not semver compatible with the recorded
+one, or at an older version, gives a warning; the decode then continues. A document from a
+version before v0.4.0 has no record and decodes with no check. The record changes when a
+package version changes, so a document that you compare as text changes too.
 
 ### Validated vs. direct loading
 
@@ -346,8 +366,8 @@ type (e.g. a field holding `Vector{<:Real}`) round-trip. Every type named inside
 The envelope reserves a handful of tree keys: `"__type__"`, `"__value__"` (the tagged
 envelope); `"type"`/`"value"` (type-parameter wrappers); `"union"`, `"where"`/`"body"`,
 `"typevar"` and `"vararg"`/`"count"` (non-`DataType` type descriptors); `"size"`/`"data"`
-(arrays); `"pairs"` (dicts); `"names"`/`"values"` (named tuples); and `"__opaque__"`
-(opaque placeholders). A struct field literally named `__type__` would collide — a documented
+(arrays); `"pairs"` (dicts); `"names"`/`"values"` (named tuples); `"__opaque__"`
+(opaque placeholders); and `"__meta__"` (the version record beside the top-level envelope). A struct field literally named `__type__` would collide — a documented
 limitation. `#undef` fields are unsupported and are reported rather than silently dropped.
 
 ## Reference
