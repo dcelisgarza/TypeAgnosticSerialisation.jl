@@ -33,6 +33,8 @@
 #     `repair = true` (a field of the context), the decode fills a missing field from the
 #     keyword constructor, drops an extra key, and keeps the leading part of a parameter
 #     list that does not fit. Without it, a missing field and a misfit list are errors.
+#     A package can also declare a step for each breaking release (`migrations`, see
+#     migrations.jl). The decode applies the declared steps with no `repair` keyword.
 #
 #   * Type resolution is gated by a **module allowlist**. A `__type__` tag can only
 #     name a type defined in an allowed module; anything else errors. There is no
@@ -67,6 +69,11 @@ export to_json, from_json, from_json_direct
 export to_yaml, from_yaml, from_yaml_direct
 export to_toml, from_toml, from_toml_direct
 export to_msgpack, from_msgpack, from_msgpack_direct
+export MigrationStep, RenameType, RenameField, AddField, RemoveField, Migration
+export ParameterMigration, @migrations
+
+# The steps that a package declares for each breaking release, and the plan of a decode.
+include("migrations.jl")
 
 # ---------------------------------------------------------------------------
 # Context: the module allowlist for type resolution.
@@ -159,6 +166,35 @@ struct SerdeContext
     # makes holds a dict; a context that the caller builds holds `nothing`, so that a
     # context that many tasks share never changes.
     seen::Union{Nothing,Dict{String,Module}}
+    # decode: the declared steps that apply to the document (see migrations.jl). Only the
+    # private copy that the two-argument `decode(tree, ctx)` makes holds a plan.
+    plan::Union{Nothing,_Plan}
+end
+
+# The positional form with `repair` and no `plan`.
+function SerdeContext(
+    modules,
+    plain_only,
+    opaque,
+    functions,
+    function_types,
+    dicts::Base.IdSet{Any},
+    validate,
+    repair::Bool,
+    seen,
+)
+    return SerdeContext(
+        modules,
+        plain_only,
+        opaque,
+        functions,
+        function_types,
+        dicts,
+        validate,
+        repair,
+        seen,
+        nothing,
+    )
 end
 
 # The positional form of v0.4.0, which had no `repair` field.
@@ -272,6 +308,7 @@ function SerdeContext(
         ds,
         validate,
         repair,
+        nothing,
         nothing,
     )
 end
@@ -596,6 +633,11 @@ function _resolve_type(desc, ctx::SerdeContext, env::Vector{TypeVar} = TypeVar[]
         end
         return UnionAll(tv, body)
     end
+    return _resolve_named(_migrate_desc(desc, ctx.plan), ctx, env)
+end
+
+# A descriptor `{"name", "module", "params"}`, after the type steps of the plan.
+function _resolve_named(desc, ctx::SerdeContext, env::Vector{TypeVar})
     if desc["name"] == "Bottom"
         return Union{}
     end
@@ -672,8 +714,10 @@ end
 # parameter. As a type parameter or as a type object, a bare `UnionAll` is correct, so
 # `_resolve_type` does not check it.
 function _value_type(desc, ctx::SerdeContext)
-    T = _resolve_type(desc, ctx)
-    if T isa UnionAll && isempty(get(desc, "params", (nothing,)))
+    haskey(desc, "name") || return _resolve_type(desc, ctx)
+    d = _migrate_desc(desc, ctx.plan)   # the parameter list after the type steps
+    T = _resolve_named(d, ctx, TypeVar[])
+    if T isa UnionAll && isempty(d["params"])
         return _apply_params(T, Any[], ctx)
     end
     return T
@@ -847,6 +891,7 @@ function encode(v, ctx::SerdeContext)
         ctx.validate,
         ctx.repair,
         Dict{String,Module}(),
+        nothing,
     )
     tree = encode(v, Any, rec)
     tree["__meta__"] = _meta(rec.seen)
@@ -986,6 +1031,12 @@ change can make the decode fail or give a different value. If the decode then fa
 throws a [`VersionChangeError`](@ref), which holds the error of the decode and the version
 changes. A tree with no record, from a version before v0.4.0, decodes with no check.
 
+The two-argument form also applies the [`MigrationStep`](@ref)s that a package of the record
+declares in [`TypeAgnosticSerialisation.migrations`](@ref): each step whose version is after
+the recorded version and not after the loaded version, in version order. A package that
+declares its steps gets no warning for a breaking version change. The three-argument form
+applies no step.
+
 A struct of the tree that lacks a field of its type, or a list of type parameters that does
 not fit the type, is an error unless `ctx.repair` is `true`. Then the decode repairs it and
 logs a warning. See *Repair* in [`SerdeContext`](@ref).
@@ -1002,13 +1053,37 @@ julia> decode(encode([1.0, 2.0, 3.0], ctx), ctx)
 """
 function decode(tree, ctx::SerdeContext)
     meta = tree isa AbstractDict ? get(tree, "__meta__", nothing) : nothing
-    changes = _version_changes(meta)
-    for c in changes
+    changes = _VersionChange[]
+    plan = nothing
+    for (name, entry) in _record_pairs(meta)
+        e = _record_entry(name, entry)
+        e === nothing && continue
+        steps = _declared_steps_cached(e.package, e.mod)
+        plan = _add_steps(plan, meta, e, steps)
+        c = _version_change(e)
+        c === nothing && continue
+        push!(changes, c)
+        # A package that declares its steps states that they cover its changes.
+        steps === nothing || continue
         @warn(
             "TypeAgnosticSerialisation: $(_change_text(c)). The decode can fail or give " *
             "a different value.",
             maxlog = 1,
             _id = Symbol(c.package, "@", c.recorded, "->", c.loaded),
+        )
+    end
+    if plan !== nothing
+        ctx = SerdeContext(
+            ctx.modules,
+            ctx.plain_only,
+            ctx.opaque,
+            ctx.functions,
+            ctx.function_types,
+            ctx.dicts,
+            ctx.validate,
+            ctx.repair,
+            ctx.seen,
+            plan,
         )
     end
     isempty(changes) && return decode(tree, Any, ctx)
@@ -1104,35 +1179,39 @@ end
 _tryparse_string(::Type{T}, s::AbstractString) where {T} = tryparse(T, s)
 _tryparse_string(::Type, _) = nothing
 
-# Each package of the record that is loaded at an incompatible or an older version. The
-# record is data from the document: a malformed entry is skipped, never an error.
-function _version_changes(meta)
-    changes = _VersionChange[]
-    meta isa AbstractDict || return changes
-    pkgs = get(meta, "packages", nothing)
-    pkgs isa AbstractDict || return changes
-    for (name, entry) in pkgs
-        (name isa AbstractString && entry isa AbstractDict) || continue
-        uuid = _tryparse_string(Base.UUID, get(entry, "uuid", nothing))
-        old = _tryparse_string(VersionNumber, get(entry, "version", nothing))
-        (uuid === nothing || old === nothing) && continue
-        m = get(Base.loaded_modules, Base.PkgId(uuid, String(name)), nothing)
-        m === nothing && continue
-        new = pkgversion(m)
-        new === nothing && continue
-        if _breaking_part(old) != _breaking_part(new)
-            why = "a breaking version change"
-        elseif new < old
-            why = "an older version"
-        else
-            continue
-        end
-        push!(
-            changes,
-            (; package = String(name), uuid, recorded = old, loaded = new, why = why),
-        )
+# The packages of the record, as `name => entry` pairs. The record is data from the
+# document: a malformed record or entry is skipped, never an error.
+function _record_pairs(meta)
+    pkgs = meta isa AbstractDict ? get(meta, "packages", nothing) : nothing
+    return pkgs isa AbstractDict ? pkgs : ()
+end
+
+# An entry of the record for a package that is loaded, with its recorded and its loaded
+# version; `nothing` for a malformed entry or a package that is not loaded.
+function _record_entry(name, entry)
+    (name isa AbstractString && entry isa AbstractDict) || return nothing
+    uuid = _tryparse_string(Base.UUID, get(entry, "uuid", nothing))
+    old = _tryparse_string(VersionNumber, get(entry, "version", nothing))
+    (uuid === nothing || old === nothing) && return nothing
+    package = String(name)
+    m = get(Base.loaded_modules, Base.PkgId(uuid, package), nothing)
+    m === nothing && return nothing
+    new = pkgversion(m)
+    new === nothing && return nothing
+    return (; package, uuid, mod = m, recorded = old, loaded = new)
+end
+
+# The change of a loaded package, if it is loaded at an incompatible or an older version.
+function _version_change(e)
+    old, new = e.recorded, e.loaded
+    if _breaking_part(old) != _breaking_part(new)
+        why = "a breaking version change"
+    elseif new < old
+        why = "an older version"
+    else
+        return nothing
     end
-    return changes
+    return _VersionChange((e.package, e.uuid, old, new, why))
 end
 
 function decode(tree, @nospecialize(H), ctx::SerdeContext)
@@ -1240,6 +1319,7 @@ function _decode_struct(payload, @nospecialize(T), ctx::SerdeContext)
             "finds them from the fields.",
         )
     end
+    payload = _migrate_payload(payload, T, ctx.plan)   # the declared steps, before the fields
     n = fieldcount(T)
     fields = Vector{Any}(undef, n)
     absent = Int[]

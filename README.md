@@ -215,7 +215,56 @@ julia> (disc.r, disc.colour)
 
 The repair is a best guess. It cannot see that a field was renamed: it fills the new field
 from its default and drops the old value. It matches a parameter list by position, and it
-cannot find a change of meaning, such as a change of units, that keeps the structure.
+cannot find a change of meaning, such as a change of units, that keeps the structure. For
+these changes, the package can declare its steps, as the next section shows.
+
+### Steps that a package declares
+
+A package can state each change of its types, so that a document of an earlier release
+loads with no guess. It declares one or more steps for each release that changed a type,
+with `@migrations` or with a method of `TypeAgnosticSerialisation.migrations`:
+
+```julia
+module MyPkg
+using TypeAgnosticSerialisation
+# ... the types of release 3.0.0 ...
+@migrations begin
+    RenameType(v"2.0.0", "OldCircle" => "Circle")
+    RenameField(v"2.0.0", "Circle", "r" => "radius")
+    AddField(v"2.0.0", "Circle", "colour" => "red")   # a value as it appears in the tree
+    RemoveField(v"2.0.0", "Circle", "border")
+    Migration(v"3.0.0", "Scene") do payload, meta     # any change, on the plain tree
+        payload["scale"] = payload["scale"] / 100      # a change of units
+        return payload
+    end
+    ParameterMigration(v"3.0.0", "Swap") do params    # Swap{B,A} became Swap{A,B}
+        return reverse(params)
+    end
+end
+end
+```
+
+When a document is read, the decode finds each package of the version record that is loaded,
+by its UUID. It applies the steps whose version is after the recorded version and not after
+the loaded version, in version order:
+
+- `RenameType` and `ParameterMigration` change the type that the document names, before the
+  decode looks it up.
+- `RenameField`, `AddField`, `RemoveField` and `Migration` change the payload of a struct,
+  before the decode reads its fields. A parent comes before its children, so a step of a
+  parent can change the payload of a child.
+
+The steps apply with no `repair` keyword, in both modes, and they operate on the plain tree
+only. A step names a type by its path in the package, as of the release of the step:
+`"Circle"`, or `"Shapes.Circle"` for a type of the submodule `Shapes`. At one version, the
+type renames come first, so the `RenameField` above names the new name `Circle`. A step can
+move a type to another submodule of the package, but not to another package.
+
+A package that declares its steps, even with no steps, gets no warning for a breaking version
+change: the declaration states that the steps cover the changes of its types. If the decode
+fails, it still throws a `VersionChangeError`. The decode uses a method only if the
+package that the record names defines it, so another package cannot give steps for it. A
+document from a version before v0.4.0 has no record, so no step applies to it.
 
 ### Validated vs. direct loading
 

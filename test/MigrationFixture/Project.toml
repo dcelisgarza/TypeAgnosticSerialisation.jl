@@ -1,0 +1,6 @@
+name = "MigrationFixture"
+uuid = "bb910ff2-999e-43d6-b50e-c75fda69fdec"
+version = "3.0.0"
+
+[deps]
+TypeAgnosticSerialisation = "711d1e8a-e0c5-5f25-919c-2a5a262959e5"
