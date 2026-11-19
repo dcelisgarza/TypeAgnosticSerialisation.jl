@@ -54,6 +54,7 @@ function _deserialise(
     opaque = (),
     functions = (),
     dicts = (),
+    repair::Bool = false,
 )
     tree = _parse(fmt, data)
     ctx = SerdeContext(
@@ -62,6 +63,7 @@ function _deserialise(
         functions = functions,
         dicts = dicts,
         validate = validate,
+        repair = repair,
     )
     return decode(tree, ctx)
 end
@@ -90,7 +92,7 @@ Read back with [`from_json`](@ref) (validated) or [`from_json_direct`](@ref).
 to_json(x; kwargs...) = _serialise(Val(:json), x; kwargs...)
 
 """
-    from_json(str; modules = (), opaque = (), functions = (), dicts = ()) -> value
+    from_json(str; modules = (), opaque = (), functions = (), dicts = (), repair = false) -> value
 
 Read a JSON string produced by [`to_json`](@ref) back into a Julia value, **validated**:
 every struct is rebuilt through its own constructor, so all inner-constructor /
@@ -103,8 +105,11 @@ mark it `opaque` or use [`from_json_direct`](@ref) for those. `modules` is the r
 allowlist (a bare `Module` is accepted); only types defined in it — plus the plain data
 types and containers of `Base`/`Core` — can be named. `functions` lists the named
 functions that may decode; the default is empty, so no function decodes. `dicts` lists
-the dict types, other than `Dict` and `IdDict`, that may decode. See
-[`SerdeContext`](@ref) for the exact rules.
+the dict types, other than `Dict` and `IdDict`, that may decode. `repair = true` repairs a
+document that an older release of a package wrote, after a change of a type: a missing
+field gets its default from the keyword constructor, an extra key is dropped, and a
+parameter list that does not fit keeps its leading part. See [`SerdeContext`](@ref) for
+the exact rules.
 
 The validation runs the constructors of the listed types on the values that the document
 gives. It checks the invariants of your own data; it does **not** make a document from an
@@ -116,7 +121,7 @@ Needs the JSON package: load it with `import JSON` first. See also
 from_json(str::AbstractString; kwargs...) = _deserialise(Val(:json), str, true; kwargs...)
 
 """
-    from_json_direct(str; modules = (), opaque = (), functions = (), dicts = ()) -> value
+    from_json_direct(str; modules = (), opaque = (), functions = (), dicts = (), repair = false) -> value
 
 Read a JSON string produced by [`to_json`](@ref) back into a Julia value, **directly**:
 each struct is built field-by-field with Julia's own `new` (via `Expr(:new)`), bypassing
@@ -128,6 +133,9 @@ validation.
 Use it for JSON you produced and trust, or for types whose constructor cannot be replayed
 from its fields. When you want invariants enforced on load, use [`from_json`](@ref)
 instead. `modules`/`opaque`/`functions`/`dicts` behave exactly as for [`from_json`](@ref).
+With `repair = true`, the direct mode drops an extra key and keeps the leading part of a
+parameter list that does not fit. It cannot fill a missing field or find a free parameter,
+because both need the constructor.
 """
 function from_json_direct(str::AbstractString; kwargs...)
     return _deserialise(Val(:json), str, false; kwargs...)
@@ -151,7 +159,7 @@ behave as for [`to_json`](@ref).
 to_yaml(x; kwargs...) = _serialise(Val(:yaml), x; kwargs...)
 
 """
-    from_yaml(str; modules = (), opaque = (), functions = (), dicts = ()) -> value
+    from_yaml(str; modules = (), opaque = (), functions = (), dicts = (), repair = false) -> value
 
 Read a YAML string produced by [`to_yaml`](@ref) back into a Julia value, **validated**
 (every struct is rebuilt through its own constructor) — the YAML counterpart of
@@ -164,7 +172,7 @@ package: load it with `import YAML` first.
 from_yaml(str::AbstractString; kwargs...) = _deserialise(Val(:yaml), str, true; kwargs...)
 
 """
-    from_yaml_direct(str; modules = (), opaque = (), functions = (), dicts = ()) -> value
+    from_yaml_direct(str; modules = (), opaque = (), functions = (), dicts = (), repair = false) -> value
 
 Read a YAML string produced by [`to_yaml`](@ref) back into a Julia value, **directly**
 (each struct is built with Julia's own `new`, no user validation) — the YAML counterpart of
@@ -192,7 +200,7 @@ behave as for [`to_json`](@ref).
 to_toml(x; kwargs...) = _serialise(Val(:toml), x; kwargs...)
 
 """
-    from_toml(str; modules = (), opaque = (), functions = (), dicts = ()) -> value
+    from_toml(str; modules = (), opaque = (), functions = (), dicts = (), repair = false) -> value
 
 Read a TOML string produced by [`to_toml`](@ref) back into a Julia value, **validated**
 (every struct is rebuilt through its own constructor) — the TOML counterpart of
@@ -201,7 +209,7 @@ Read a TOML string produced by [`to_toml`](@ref) back into a Julia value, **vali
 from_toml(str::AbstractString; kwargs...) = _deserialise(Val(:toml), str, true; kwargs...)
 
 """
-    from_toml_direct(str; modules = (), opaque = (), functions = (), dicts = ()) -> value
+    from_toml_direct(str; modules = (), opaque = (), functions = (), dicts = (), repair = false) -> value
 
 Read a TOML string produced by [`to_toml`](@ref) back into a Julia value, **directly**
 (each struct is built with Julia's own `new`, no user validation) — the TOML counterpart of
@@ -230,7 +238,7 @@ behave as for [`to_json`](@ref).
 to_msgpack(x; kwargs...) = _serialise(Val(:msgpack), x; kwargs...)
 
 """
-    from_msgpack(bytes; modules = (), opaque = (), functions = (), dicts = ()) -> value
+    from_msgpack(bytes; modules = (), opaque = (), functions = (), dicts = (), repair = false) -> value
 
 Read MessagePack bytes produced by [`to_msgpack`](@ref) back into a Julia value,
 **validated** (every struct is rebuilt through its own constructor) — the MessagePack
@@ -242,7 +250,7 @@ function from_msgpack(bytes::AbstractVector{UInt8}; kwargs...)
 end
 
 """
-    from_msgpack_direct(bytes; modules = (), opaque = (), functions = (), dicts = ()) -> value
+    from_msgpack_direct(bytes; modules = (), opaque = (), functions = (), dicts = (), repair = false) -> value
 
 Read MessagePack bytes produced by [`to_msgpack`](@ref) back into a Julia value,
 **directly** (each struct is built with Julia's own `new`, no user validation) — the

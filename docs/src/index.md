@@ -163,6 +163,56 @@ document from a version before v0.4.0 has no record and decodes with no check. T
 changes when a package version changes, so a document that you compare as text changes
 too.
 
+### Repair after a change of a type
+
+A release of a package can change a type after a document was written. A field that the
+type gained and the document lacks is an error, and so is a list of type parameters that no
+longer fits the type. Pass `repair = true` to a loader, or to [`SerdeContext`](@ref), and
+the decode repairs the document and logs a warning:
+
+- A missing field gets its default from the keyword constructor, such as a default of
+  `Base.@kwdef`. This needs the validated mode.
+- A key that is no field of the type is dropped. With no `repair`, it is dropped with no
+  warning.
+- A parameter list that does not fit keeps its longest leading part that fits. The
+  constructor finds the free parameters from the fields, so this case needs the validated
+  mode when parameters stay free.
+
+Here, a later release of `Shape` gives `Disc` a field `colour` with a default. The document
+of the earlier release loads with the default:
+
+```jldoctest repair; filter = [r"for \S*Disc\.", r"└ @ .*"]
+julia> using TypeAgnosticSerialisation
+
+julia> module Shape1
+           struct Disc
+               r::Float64
+           end
+       end;
+
+julia> module Shape2
+           Base.@kwdef struct Disc
+               r::Float64
+               colour::String = "red"
+           end
+       end;
+
+julia> tree = encode(Shape1.Disc(1.5), SerdeContext(Shape1));
+
+julia> tree["__type__"]["module"] = string(Shape2);   # the type of the later release
+
+julia> disc = decode(tree, SerdeContext(Shape2; validate = true, repair = true));
+┌ Warning: TypeAgnosticSerialisation (repair): the document has no field `colour` for Main.Shape2.Disc. The keyword constructor fills it with its default.
+└ @ TypeAgnosticSerialisation
+
+julia> (disc.r, disc.colour)
+(1.5, "red")
+```
+
+The repair is a best guess. It cannot see that a field was renamed: it fills the new field
+from its default and drops the old value. It matches a parameter list by position, and it
+cannot find a change of meaning, such as a change of units, that keeps the structure.
+
 ### Validated vs. direct loading
 
 `from_json` is **validated**: every struct is rebuilt through its own constructor, so all

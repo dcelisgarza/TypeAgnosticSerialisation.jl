@@ -29,6 +29,11 @@
 #     box. Plain `Base` reflection (calling `T.name.wrapper(…)`) handles that. The
 #     `encode`/`decode` core is text-agnostic — swap the JSON layer freely.
 #
+#   * A document can outlive a release of a package that changes a type. With
+#     `repair = true` (a field of the context), the decode fills a missing field from the
+#     keyword constructor, drops an extra key, and keeps the leading part of a parameter
+#     list that does not fit. Without it, a missing field and a misfit list are errors.
+#
 #   * Type resolution is gated by a **module allowlist**. A `__type__` tag can only
 #     name a type defined in an allowed module; anything else errors. There is no
 #     `eval` of strings from the JSON. Of `Base` and `Core`, only the plain data types
@@ -68,11 +73,11 @@ export to_msgpack, from_msgpack, from_msgpack_direct
 # ---------------------------------------------------------------------------
 
 """
-    SerdeContext(modules; opaque = (), functions = (), dicts = (), validate = false)
-    SerdeContext(single_module::Module; opaque = (), functions = (), dicts = (), validate = false)
-    SerdeContext(; modules = (), opaque = (), functions = (), dicts = (), validate = false)
+    SerdeContext(modules; opaque = (), functions = (), dicts = (), validate = false, repair = false)
+    SerdeContext(single_module::Module; opaque = (), functions = (), dicts = (), validate = false, repair = false)
+    SerdeContext(; modules = (), opaque = (), functions = (), dicts = (), validate = false, repair = false)
 
-The state threaded through every [`encode`](@ref)/[`decode`](@ref) call. It holds five
+The state threaded through every [`encode`](@ref)/[`decode`](@ref) call. It holds six
 things:
 
   - `modules`: the **allowlist** used to resolve `__type__` tags back to concrete types. A
@@ -99,6 +104,32 @@ things:
   - `validate`: chooses the decode strategy. `true` rebuilds each struct through its own
     constructor (running all validation); `false` builds directly with Julia's `new`
     (no validation). See [`from_json`](@ref) and [`from_json_direct`](@ref).
+  - `repair`: lets the decode repair a document that an older release of a package wrote,
+    after a change of a type. The default is `false`. See *Repair* below.
+
+# Repair
+
+A struct of the document can differ from the struct type as the package now defines it.
+With `repair = false`, a missing field and a parameter list that does not fit are errors
+that name the difference. With `repair = true`, the decode repairs each difference below
+and logs a warning:
+
+  - A field that the type has and the document does not have. The decode calls the keyword
+    constructor of the type with only the fields of the document, so a `Base.@kwdef`
+    default fills the rest. If that call fails, the error names the missing fields. This
+    repair needs the validated mode: `new` has no defaults.
+  - A key of the document that is not a field of the type. The decode drops it, in both
+    modes. With `repair = false`, the decode drops it with no warning.
+  - A list of type parameters that does not fit the type, because a release added,
+    removed or changed the bound of a parameter. The decode keeps the longest leading part
+    of the list that still fits. If parameters remain free, the constructor of the type
+    finds them from the fields, so this case needs the validated mode. A field whose
+    declared type uses a free parameter must have a tagged value in the document.
+
+A field rename is a missing field and an extra key together. The repair cannot see that
+the two are the same field, so it fills the new field from its default and drops the old
+value. The leading part of a parameter list is a match by position: a release that removes
+or moves a parameter at the front shifts the others.
 
 A dict decodes only into `Dict`, `IdDict` or a type of `dicts`, even when `Base` is listed:
 the decode calls `T()` and `setindex!` with the keys and values of the document, and another
@@ -122,11 +153,36 @@ struct SerdeContext
     function_types::Dict{Tuple{String,String},DataType}  # (module, name) => typeof(f)
     dicts::Base.IdSet{Any}         # wrappers of the dict types that may decode
     validate::Bool                 # decode: true = via constructor; false = direct `new`
+    repair::Bool                   # decode: repair a document after a change of a type
     # encode: the root modules of the types that the encoder described, keyed by name, for
     # the `"__meta__"` record. Only the private copy that the top-level `encode(v, ctx)`
     # makes holds a dict; a context that the caller builds holds `nothing`, so that a
     # context that many tasks share never changes.
     seen::Union{Nothing,Dict{String,Module}}
+end
+
+# The positional form of v0.4.0, which had no `repair` field.
+function SerdeContext(
+    modules,
+    plain_only,
+    opaque,
+    functions,
+    function_types,
+    dicts::Base.IdSet{Any},
+    validate,
+    seen,
+)
+    return SerdeContext(
+        modules,
+        plain_only,
+        opaque,
+        functions,
+        function_types,
+        dicts,
+        validate,
+        false,
+        seen,
+    )
 end
 
 # The positional form of v0.3.1, which had no `seen` field.
@@ -147,6 +203,7 @@ function SerdeContext(
         function_types,
         dicts,
         validate,
+        false,
         nothing,
     )
 end
@@ -179,7 +236,14 @@ function _dict_set(dicts)
     return s
 end
 
-function SerdeContext(mods; opaque = (), functions = (), dicts = (), validate::Bool = false)
+function SerdeContext(
+    mods;
+    opaque = (),
+    functions = (),
+    dicts = (),
+    validate::Bool = false,
+    repair::Bool = false,
+)
     listed = collect(Module, mods)
     d = Dict{String,Module}()
     for m in (Base, Core, listed...)
@@ -199,7 +263,17 @@ function SerdeContext(mods; opaque = (), functions = (), dicts = (), validate::B
         ftypes[(string(parentmodule(F)), string(nameof(F)))] = F
     end
     ds = _dict_set(dicts)
-    return SerdeContext(d, plain_only, collect(Any, opaque), fs, ftypes, ds, validate)
+    return SerdeContext(
+        d,
+        plain_only,
+        collect(Any, opaque),
+        fs,
+        ftypes,
+        ds,
+        validate,
+        repair,
+        nothing,
+    )
 end
 # A single module is the common case; accept it without asking the caller to wrap it in a
 # one-tuple (`modules = MyPkg` rather than `modules = (MyPkg,)`).
@@ -548,7 +622,7 @@ function _resolve_type(desc, ctx::SerdeContext, env::Vector{TypeVar} = TypeVar[]
     _check_type(base, ctx)
     params = Any[_resolve_param(p, ctx, env) for p in desc["params"]]
     if !isempty(params)
-        return Core.apply_type(base, params...)
+        return _apply_params(base, params, ctx)
     else
         # Zero params: a leaf DataType (Symbol, Int64, Nothing) or a bare UnionAll
         # (Newton, Vector) resolves to `base` as-is — `apply_type` would error on
@@ -557,6 +631,74 @@ function _resolve_type(desc, ctx::SerdeContext, env::Vector{TypeVar} = TypeVar[]
         # is `Tuple{Vararg{Any}}`, so it always carries its Vararg parameter.)
         return base === Tuple ? Tuple{} : base
     end
+end
+
+# The encoder writes the parameters of a `DataType` only, so the list of the document is
+# the complete list. A release that adds, removes or changes the bound of a parameter
+# makes it misfit: `apply_type` fails, or gives a `UnionAll` in place of a `DataType`.
+function _apply_params(@nospecialize(base), params::Vector{Any}, ctx::SerdeContext)
+    T = try
+        Core.apply_type(base, params...)
+    catch
+        nothing
+    end
+    T isa DataType && return T
+    shown = "{$(join(params, ", "))}"
+    misfit =
+        "the document gives $(base) " *
+        (isempty(params) ? "no parameters" : "the parameters $(shown)") *
+        ", which do not fit its definition $(Base.unwrap_unionall(base))."
+    if !ctx.repair
+        error(
+            "TypeAgnosticSerialisation: $(misfit) A release of the package can change the " *
+            "parameters of a type after the document was written. Pass `repair = true` " *
+            "to keep the leading parameters that fit.",
+        )
+    end
+    R = _refit(base, params)
+    rest =
+        R isa UnionAll ? ", and the constructor finds the free parameters from the fields" :
+        ""
+    @warn(
+        "TypeAgnosticSerialisation (repair): $(misfit) The decode uses $(R)$(rest).",
+        maxlog = 1,
+        _id = Symbol("refit ", base, shown),
+    )
+    return R
+end
+
+# The type of a tagged value. A value has a `DataType`, so a bare `UnionAll` such as
+# `Circle` is an empty parameter list that does not fit: a release gave the type its first
+# parameter. As a type parameter or as a type object, a bare `UnionAll` is correct, so
+# `_resolve_type` does not check it.
+function _value_type(desc, ctx::SerdeContext)
+    T = _resolve_type(desc, ctx)
+    if T isa UnionAll && isempty(get(desc, "params", (nothing,)))
+        return _apply_params(T, Any[], ctx)
+    end
+    return T
+end
+
+# The longest leading part of `params` that `base` accepts. With none, the bare `base`.
+function _refit(@nospecialize(base), params::Vector{Any})
+    for k = min(length(params), _count_vars(base)):-1:1
+        T = try
+            Core.apply_type(base, params[1:k]...)
+        catch
+            nothing
+        end
+        T === nothing || return T
+    end
+    return base
+end
+
+function _count_vars(@nospecialize(T))
+    n = 0
+    while T isa UnionAll
+        n += 1
+        T = T.body
+    end
+    return n
 end
 
 # ---------------------------------------------------------------------------
@@ -598,12 +740,17 @@ function _construct_safe(@nospecialize(T::DataType), fields::Vector{Any})
     if typeof(x) === T
         return x
     end
-    # The constructor ran (so its validation passed on these very field values) but
-    # re-derived *different* type parameters from them: `Pair(1, "a")` is a
-    # `Pair{Int,String}`, not the `Pair{Int,Any}` that was encoded. Rebuild at the exact
-    # type — through the parameterised constructor, else by `convert`.
+    return _retype(T, x, fields, false)
+end
+
+# The constructor ran (so its validation passed on these very field values) but
+# re-derived *different* type parameters from them: `Pair(1, "a")` is a
+# `Pair{Int,String}`, not the `Pair{Int,Any}` that was encoded. Rebuild at the exact
+# type — through the parameterised constructor, else by `convert`. `args` are the
+# positional fields, or with `kw = true` the named tuple of the keyword call.
+function _retype(@nospecialize(T::DataType), @nospecialize(x), args, kw::Bool)
     y = try
-        T(fields...)
+        kw ? T(; args...) : T(args...)
     catch
         try
             convert(T, x)
@@ -614,15 +761,17 @@ function _construct_safe(@nospecialize(T::DataType), fields::Vector{Any})
     if typeof(y) === T
         return y
     end
+    call = kw ? "$(T)(; $(join(keys(args), ", ")))" : "$(T)(fields...)"
     return error(
         "TypeAgnosticSerialisation (validate): the constructor of $(T) built a " *
-        "$(typeof(x)) instead, and neither `$(T)(fields...)` nor `convert($(T), …)` " *
+        "$(typeof(x)) instead, and neither `$(call)` nor `convert($(T), …)` " *
         "gives the exact type. Mark the type opaque or use `from_json_direct`.",
     )
 end
 
-function _construct_via_wrapper(@nospecialize(T::DataType), fields::Vector{Any})
-    base = T.name.wrapper   # unparameterised type: its ctor rederives the parameters
+# `T` is a `DataType`, or the `UnionAll` of a repaired parameter list (`_refit`).
+function _construct_via_wrapper(@nospecialize(T::Type), fields::Vector{Any})
+    base = _wrapper(T)   # unparameterised type: its ctor rederives the parameters
     # Positional in declaration order is the canonical constructor for `@concrete`
     # structs (its validating inner ctor) and for most Base types (Day, TwicePrecision,
     # Complex, Rational). Fall back to keyword-by-field-name for types that only expose
@@ -636,8 +785,8 @@ function _construct_via_wrapper(@nospecialize(T::DataType), fields::Vector{Any})
             flist = join(fieldnames(T), ", ")
             error(
                 "TypeAgnosticSerialisation (validate): could not reconstruct $(T) through a " *
-                "constructor. Tried `$(nameof(T))(fields...)` → " *
-                "$(sprint(showerror, e_pos)); and `$(nameof(T))(; $(flist)...)` → " *
+                "constructor. Tried `$(nameof(base))(fields...)` → " *
+                "$(sprint(showerror, e_pos)); and `$(nameof(base))(; $(flist)...)` → " *
                 "$(sprint(showerror, e_kw)). Mark the type opaque or use " *
                 "`from_json_direct`.",
             )
@@ -696,6 +845,7 @@ function encode(v, ctx::SerdeContext)
         ctx.function_types,
         ctx.dicts,
         ctx.validate,
+        ctx.repair,
         Dict{String,Module}(),
     )
     tree = encode(v, Any, rec)
@@ -835,6 +985,10 @@ recorded one, or at an older version, it logs a warning and then decodes. A brea
 change can make the decode fail or give a different value. If the decode then fails, it
 throws a [`VersionChangeError`](@ref), which holds the error of the decode and the version
 changes. A tree with no record, from a version before v0.4.0, decodes with no check.
+
+A struct of the tree that lacks a field of its type, or a list of type parameters that does
+not fit the type, is an error unless `ctx.repair` is `true`. Then the decode repairs it and
+logs a warning. See *Repair* in [`SerdeContext`](@ref).
 
 ```jldoctest
 julia> ctx = SerdeContext();
@@ -983,7 +1137,7 @@ end
 
 function decode(tree, @nospecialize(H), ctx::SerdeContext)
     if tree isa AbstractDict && haskey(tree, "__type__")
-        T = _resolve_type(tree["__type__"], ctx)
+        T = _value_type(tree["__type__"], ctx)
         return _decode_plain(tree["__value__"], T, ctx)
     else
         if !(isconcretetype(H))
@@ -1006,6 +1160,12 @@ function _decode_plain(payload, @nospecialize(T), ctx::SerdeContext)
     elseif T <: Type
         # The value itself is a type; payload is a type reference.
         return _resolve_type(payload, ctx)
+    elseif T isa UnionAll
+        # A repaired parameter list (`_refit`) gives a `UnionAll` here. Any other
+        # `UnionAll` names no value.
+        ctx.repair ||
+            error("TypeAgnosticSerialisation: don't know how to decode into type $(T).")
+        return _decode_struct(payload, T, ctx)
     elseif T <: Base.Enum
         sym = Symbol(payload)
         idx = findfirst(e -> Symbol(e) == sym, instances(T))
@@ -1055,14 +1215,149 @@ function _decode_plain(payload, @nospecialize(T), ctx::SerdeContext)
         )
         return T(vals)
     elseif isstructtype(T)
-        fields = Any[
-            decode(payload[String(fieldname(T, i))], fieldtype(T, i), ctx) for
-            i = 1:fieldcount(T)
-        ]
-        return ctx.validate ? _construct_safe(T, fields) : _newbuild(T, fields)
+        return _decode_struct(payload, T, ctx)
     else
         error("TypeAgnosticSerialisation: don't know how to decode into type $(T).")
     end
+end
+
+# The value of `get` for a field that the document does not have.
+struct _Absent end
+
+# The fields of a struct of the document. A field that the type has and the document does
+# not have, and a key that the type does not have, show a change of the type after the
+# encode. `ctx.repair` chooses between an error and a repair; see `SerdeContext`.
+function _decode_struct(payload, @nospecialize(T), ctx::SerdeContext)
+    U = Base.unwrap_unionall(T)
+    if !(U isa DataType && isstructtype(U))
+        error("TypeAgnosticSerialisation: don't know how to decode into type $(T).")
+    end
+    if T isa UnionAll && !ctx.validate
+        error(
+            "TypeAgnosticSerialisation (repair): the type $(T) has free parameters, and " *
+            "the direct mode builds a struct with `new`, which needs each parameter. " *
+            "Load with the validated mode and `repair = true`, so that the constructor " *
+            "finds them from the fields.",
+        )
+    end
+    n = fieldcount(T)
+    fields = Vector{Any}(undef, n)
+    absent = Int[]
+    for i = 1:n
+        v = get(payload, String(fieldname(T, i)), _Absent())
+        if v isa _Absent
+            (ctx.repair && ctx.validate) || _missing_fields_error(payload, T, ctx)
+            push!(absent, i)
+        else
+            fields[i] = _decode_field(v, T, i, ctx)
+        end
+    end
+    ctx.repair && _drop_extra_keys(payload, T)
+    if !isempty(absent)
+        return _construct_partial(T, fields, absent)
+    elseif !ctx.validate
+        return _newbuild(T, fields)
+    elseif T isa DataType
+        return _construct_safe(T, fields)
+    else
+        return _at_refit(T, _construct_via_wrapper(T, fields))
+    end
+end
+
+function _decode_field(v, @nospecialize(T), i::Int, ctx::SerdeContext)
+    H = fieldtype(T, i)
+    if T isa UnionAll &&
+       !isconcretetype(H) &&
+       !(v isa AbstractDict && haskey(v, "__type__"))
+        error(
+            "TypeAgnosticSerialisation (repair): the declared type of the field " *
+            "`$(fieldname(T, i))` of $(T) uses a free parameter, and the document holds its " *
+            "value with no type tag. The repair cannot find the type of the value.",
+        )
+    end
+    return decode(v, H, ctx)
+end
+
+# The keys that the document has and the type does not have.
+function _extra_keys(payload, @nospecialize(T))
+    names = fieldnames(T)
+    return String[string(k) for k in keys(payload) if !(Symbol(k) in names)]
+end
+
+_names_text(names) = join(("`$(s)`" for s in names), ", ")
+
+function _missing_fields_error(payload, @nospecialize(T), ctx::SerdeContext)
+    absent = Symbol[s for s in fieldnames(T) if !haskey(payload, String(s))]
+    extra = _extra_keys(payload, T)
+    msg =
+        "TypeAgnosticSerialisation: the document has no field $(_names_text(absent)) " *
+        "for $(T)."
+    if !isempty(extra)
+        msg *=
+            " It has the keys $(_names_text(extra)), which are no fields of $(T). A " *
+            "renamed field gives such a pair."
+    end
+    if ctx.repair
+        msg *=
+            " The direct mode builds a struct with `new`, which has no default to fill a " *
+            "field. Load with the validated mode and `repair = true`, so that the keyword " *
+            "constructor fills it."
+    else
+        msg *=
+            " A release of the package can add a field after the document was written. " *
+            "Pass `repair = true` to fill it from a default of the keyword constructor."
+    end
+    return error(msg)
+end
+
+function _drop_extra_keys(payload, @nospecialize(T))
+    extra = _extra_keys(payload, T)
+    isempty(extra) && return nothing
+    @warn(
+        "TypeAgnosticSerialisation (repair): the document gives $(T) the keys " *
+        "$(_names_text(extra)), which are no fields of it. The decode drops them.",
+        maxlog = 1,
+        _id = Symbol("drop ", _wrapper(T), " ", join(extra, ",")),
+    )
+    return nothing
+end
+
+# Validated mode with `repair = true`: the keyword constructor fills the absent fields.
+function _construct_partial(@nospecialize(T), fields::Vector{Any}, absent::Vector{Int})
+    present = [i for i = 1:fieldcount(T) if !(i in absent)]
+    kw = NamedTuple{Tuple(fieldname(T, i) for i in present)}(Tuple(fields[present]))
+    missing_names = _names_text(fieldname(T, i) for i in absent)
+    base = _wrapper(T)
+    x = try
+        base(; kw...)
+    catch e
+        e isa InterruptException && rethrow()
+        error(
+            "TypeAgnosticSerialisation (repair): the document has no field " *
+            "$(missing_names) for $(T), and the keyword constructor " *
+            "`$(nameof(base))(; $(join(keys(kw), ", ")))` fails: " *
+            "$(sprint(showerror, e)). Give the field a default, for example with " *
+            "`Base.@kwdef`.",
+        )
+    end
+    y = T isa DataType ? (typeof(x) === T ? x : _retype(T, x, kw, true)) : _at_refit(T, x)
+    @warn(
+        "TypeAgnosticSerialisation (repair): the document has no field $(missing_names) " *
+        "for $(T). The keyword constructor fills it with its default.",
+        maxlog = 1,
+        _id = Symbol("fill ", base, " ", missing_names),
+    )
+    return y
+end
+
+# The constructor of a repaired parameter list finds the free parameters; the value must
+# still be of the leading parameters that the document gives.
+function _at_refit(@nospecialize(T::UnionAll), @nospecialize(x))
+    x isa T && return x
+    return error(
+        "TypeAgnosticSerialisation (repair): the constructor of $(_wrapper(T)) built a " *
+        "$(typeof(x)), which is not a $(T).",
+    )
 end
 
 function _decode_number(@nospecialize(T), payload)
