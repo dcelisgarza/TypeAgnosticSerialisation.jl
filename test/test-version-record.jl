@@ -60,11 +60,27 @@ end
     @test (@test_logs decode(tree, ctx)) isa Scene
 end
 
-# Set the recorded version of `TypeAgnosticSerialisation` in a fresh tree of 1.5.
-function tree_with_version(v)
-    tree = encode(1.5, SerdeContext())
+# Set the recorded version of `TypeAgnosticSerialisation` in a fresh tree of `x`.
+function tree_with_version(v, x = 1.5, ctx = SerdeContext())
+    tree = encode(x, ctx)
     tree["__meta__"]["packages"][TAS_NAME]["version"] = v
     return tree
+end
+
+# The same, with a payload that the decode of a `Float64` cannot parse.
+function broken_tree_with_version(v)
+    tree = tree_with_version(v)
+    tree["__value__"] = "one and a half"
+    return tree
+end
+
+# A dict type whose `setindex!` is interrupted, to show that the decode does not wrap an
+# `InterruptException`.
+module VersionErrorTypes
+struct InterruptDict{K,V} <: AbstractDict{K,V}
+    InterruptDict{K,V}() where {K,V} = new{K,V}()
+end
+Base.setindex!(::InterruptDict, v, k) = throw(InterruptException())
 end
 
 @testset "a compatible version decodes with no warning" begin
@@ -85,6 +101,59 @@ end
         tree_with_version(older),
         SerdeContext(),
     )) == 1.5
+end
+
+@testset "a failed decode after a version change names the change" begin
+    now = pkgversion(TAS)
+    for (v, why) in (
+        (VersionNumber(now.major + 1, 0, 0), "a breaking version change"),
+        (VersionNumber(now.major, now.minor, now.patch + 1), "an older version"),
+    )
+        r = @test_logs (:warn, Regex(why)) @test_throws VersionChangeError decode(
+            broken_tree_with_version(string(v)),
+            SerdeContext(),
+        )
+        err = r.value
+        @test err.error isa ArgumentError
+        c = only(err.changes)
+        @test c.package == TAS_NAME
+        @test c.uuid == Base.PkgId(TAS).uuid
+        @test (c.recorded, c.loaded, c.why) == (v, now, why)
+        msg = sprint(showerror, err)
+        @test startswith(msg, "VersionChangeError: ArgumentError: cannot parse")
+        @test occursin(
+            "the document was written with $(TAS_NAME) v$(v), and $(TAS_NAME) v$(now) " *
+            "is loaded, $(why).",
+            msg,
+        )
+    end
+    # An error of the decode itself, such as a type that is not defined, is wrapped too.
+    tree = tree_with_version(string(VersionNumber(now.major + 1, 0, 0)))
+    tree["__type__"]["name"] = "NoSuchFloat"
+    r = @test_logs (:warn,) @test_throws VersionChangeError decode(tree, SerdeContext())
+    @test r.value.error isa ErrorException
+    @test occursin("Core.NoSuchFloat is not defined", sprint(showerror, r.value))
+end
+
+@testset "a failed decode with no version change gives the error unchanged" begin
+    @test_logs @test_throws ArgumentError decode(
+        broken_tree_with_version(string(pkgversion(TAS))),
+        SerdeContext(),
+    )
+    # A tree with no record, from before v0.4.0.
+    tree = broken_tree_with_version(string(pkgversion(TAS)))
+    delete!(tree, "__meta__")
+    @test_logs @test_throws ArgumentError decode(tree, SerdeContext())
+end
+
+@testset "an interrupt of the decode is not wrapped" begin
+    V = VersionErrorTypes
+    ctx = SerdeContext(V; dicts = (V.InterruptDict,))
+    breaking = string(VersionNumber(pkgversion(TAS).major + 1, 0, 0))
+    tree = tree_with_version(breaking, Dict("a" => 1), ctx)
+    tree["__type__"]["name"] = "InterruptDict"
+    tree["__type__"]["module"] = string(V)
+    @test_logs (:warn,) @test_throws InterruptException decode(tree, ctx)
 end
 
 @testset "the semver rule of a breaking change" begin

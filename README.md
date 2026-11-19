@@ -160,9 +160,12 @@ records the Julia version that wrote the document, and the UUID and version of e
 that defines a type of the document, and of TypeAgnosticSerialisation itself. A module that
 is not a package, such as `Main.Shapes` above, has no entry. When a document is read, each
 recorded package that is loaded at a version that is not semver compatible with the recorded
-one, or at an older version, gives a warning; the decode then continues. A document from a
-version before v0.4.0 has no record and decodes with no check. The record changes when a
-package version changes, so a document that you compare as text changes too.
+one, or at an older version, gives a warning; the decode then continues. If the decode
+fails, the error is a `VersionChangeError`: its message gives the error of the
+decode and then the version changes, and its `error` field holds the original error. A
+document from a version before v0.4.0 has no record and decodes with no check. The record
+changes when a package version changes, so a document that you compare as text changes
+too.
 
 ### Validated vs. direct loading
 

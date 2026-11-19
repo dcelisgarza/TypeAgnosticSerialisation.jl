@@ -57,7 +57,7 @@
 
 module TypeAgnosticSerialisation
 
-export SerdeContext, encode, decode
+export SerdeContext, encode, decode, VersionChangeError
 export to_json, from_json, from_json_direct
 export to_yaml, from_yaml, from_yaml_direct
 export to_toml, from_toml, from_toml_direct
@@ -832,8 +832,9 @@ are rebuilt — through their constructor (validated) or via `new` (direct). See
 The two-argument form reads the `"__meta__"` record that [`encode`](@ref) writes. If a
 package of the record is loaded at a version that is not semver compatible with the
 recorded one, or at an older version, it logs a warning and then decodes. A breaking
-change can make the decode fail or give a different value. A tree with no record, from a
-version before v0.4.0, decodes with no check.
+change can make the decode fail or give a different value. If the decode then fails, it
+throws a [`VersionChangeError`](@ref), which holds the error of the decode and the version
+changes. A tree with no record, from a version before v0.4.0, decodes with no check.
 
 ```jldoctest
 julia> ctx = SerdeContext();
@@ -846,10 +847,96 @@ julia> decode(encode([1.0, 2.0, 3.0], ctx), ctx)
 ```
 """
 function decode(tree, ctx::SerdeContext)
-    if tree isa AbstractDict && haskey(tree, "__meta__")
-        _check_versions(tree["__meta__"])
+    meta = tree isa AbstractDict ? get(tree, "__meta__", nothing) : nothing
+    changes = _version_changes(meta)
+    for c in changes
+        @warn(
+            "TypeAgnosticSerialisation: $(_change_text(c)). The decode can fail or give " *
+            "a different value.",
+            maxlog = 1,
+            _id = Symbol(c.package, "@", c.recorded, "->", c.loaded),
+        )
     end
-    return decode(tree, Any, ctx)
+    isempty(changes) && return decode(tree, Any, ctx)
+    try
+        return decode(tree, Any, ctx)
+    catch e
+        e isa InterruptException && rethrow()
+        throw(VersionChangeError(e, changes))
+    end
+end
+
+# A package of the record that is loaded at an incompatible or an older version.
+const _VersionChange = @NamedTuple{
+    package::String,
+    uuid::Base.UUID,
+    recorded::VersionNumber,
+    loaded::VersionNumber,
+    why::String,
+}
+
+function _change_text(c::_VersionChange)
+    return "the document was written with $(c.package) v$(c.recorded), and " *
+           "$(c.package) v$(c.loaded) is loaded, $(c.why)"
+end
+
+"""
+    VersionChangeError(error, changes)
+
+The error of a [`decode`](@ref) that failed on a document whose `"__meta__"` record shows a
+version change. `error` is the error of the decode. `changes` lists each package of the
+record that is loaded at a version that is not semver compatible with the recorded one, or
+at an older version. Each entry is a named tuple `(; package, uuid, recorded, loaded, why)`,
+where `why` is `"a breaking version change"` or `"an older version"`.
+
+A decode throws this error only when the record shows such a change. With no change, the
+error of the decode comes out unchanged. A change of a type in a breaking release, such as
+a field that is added or renamed, is a frequent cause.
+
+The example below sets the recorded version to 99.0.0, which is not semver compatible
+with the loaded version, and breaks the payload. The loaded version and the source
+location of the warning change from one run to the next, so the doctest filters them.
+
+```jldoctest; filter = [r"(?<=TypeAgnosticSerialisation )v[^ ]+(?= is loaded)", r"└ @ .*"]
+julia> ctx = SerdeContext();
+
+julia> tree = encode(1.5, ctx);
+
+julia> tree["__meta__"]["packages"]["TypeAgnosticSerialisation"]["version"] = "99.0.0";
+
+julia> tree["__value__"] = "one and a half";
+
+julia> err = try
+           decode(tree, ctx)
+       catch e
+           e
+       end;
+┌ Warning: TypeAgnosticSerialisation: the document was written with TypeAgnosticSerialisation v99.0.0, and TypeAgnosticSerialisation v0.4.0 is loaded, a breaking version change. The decode can fail or give a different value.
+└ @ TypeAgnosticSerialisation
+
+julia> err isa VersionChangeError
+true
+
+julia> err.error isa ArgumentError
+true
+
+julia> only(err.changes).why
+"a breaking version change"
+```
+"""
+struct VersionChangeError <: Exception
+    error::Any
+    changes::Vector{_VersionChange}
+end
+
+function Base.showerror(io::IO, e::VersionChangeError)
+    print(io, "VersionChangeError: ")
+    showerror(io, e.error)
+    print(io, "\nThe version record of the document shows a change that can be the cause:")
+    for c in e.changes
+        print(io, "\n  - ", _change_text(c), ".")
+    end
+    return nothing
 end
 
 # The part of a version that a breaking change increments, by semver as Pkg reads it.
@@ -863,12 +950,13 @@ end
 _tryparse_string(::Type{T}, s::AbstractString) where {T} = tryparse(T, s)
 _tryparse_string(::Type, _) = nothing
 
-# Warn for each package of the record that is loaded at an incompatible or older version.
-# The record is data from the document: a malformed entry is skipped, never an error.
-function _check_versions(meta)
-    meta isa AbstractDict || return nothing
+# Each package of the record that is loaded at an incompatible or an older version. The
+# record is data from the document: a malformed entry is skipped, never an error.
+function _version_changes(meta)
+    changes = _VersionChange[]
+    meta isa AbstractDict || return changes
     pkgs = get(meta, "packages", nothing)
-    pkgs isa AbstractDict || return nothing
+    pkgs isa AbstractDict || return changes
     for (name, entry) in pkgs
         (name isa AbstractString && entry isa AbstractDict) || continue
         uuid = _tryparse_string(Base.UUID, get(entry, "uuid", nothing))
@@ -885,15 +973,12 @@ function _check_versions(meta)
         else
             continue
         end
-        @warn(
-            "TypeAgnosticSerialisation: the document was written with $(name) v$(old), " *
-            "and $(name) v$(new) is loaded, $(why). The decode can fail or give a " *
-            "different value.",
-            maxlog = 1,
-            _id = Symbol(name, "@", old, "->", new),
+        push!(
+            changes,
+            (; package = String(name), uuid, recorded = old, loaded = new, why = why),
         )
     end
-    return nothing
+    return changes
 end
 
 function decode(tree, @nospecialize(H), ctx::SerdeContext)
